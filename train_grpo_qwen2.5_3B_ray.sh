@@ -4,7 +4,7 @@ export CUDA_VISIBLE_DEVICES=0,1
 # ray stop --force
 
 # 在容器中启动 Ray 的主节点
-RAY_memory_monitor_refresh_ms=0 ray start --head --node-ip-address 0.0.0.0 --num-gpus 2 --port 9510
+RAY_memory_monitor_refresh_ms=0 ray start --head --node-ip-address 0.0.0.0 --num-gpus 2 --port 9545
 
 
 
@@ -43,7 +43,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --zero_stage 3 \
    --bf16 \
    --actor_learning_rate 3e-6 \
-   --prompt_data ../data/MATH-8k \
+   --prompt_data train_data/MATH-8k \
    --input_key problem \
    --label_key solution \
    --apply_chat_template \
