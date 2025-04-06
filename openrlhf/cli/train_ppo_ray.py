@@ -16,6 +16,10 @@ from openrlhf.trainer.ray import (
 )
 from openrlhf.utils import get_strategy
 
+import os
+
+os.environ["WANDB__SERVICE_WAIT"] = "300"
+
 
 # NOTE: reward function for multiple reward models, replace this with your own function!
 def reward_fn(rewards: List[torch.Tensor]):
@@ -43,8 +47,8 @@ def _validate_args(args):
         ), f"actor_world_size must be divisible by critic_world_size, got {actor_world_size} and {critic_world_size}"
 
     if args.use_kl_loss:
-        if args.kl_estimator not in ["k2", "k3"]:
-            print(f"Recommend setting {args.kl_estimator} to 'k2' or 'k3' when using KL as a loss")
+        if args.kl_estimator not in ["k2", "k3","k4"]:
+            print(f"Recommend setting {args.kl_estimator} to 'k4' or 'k2' or 'k3' when using KL as a loss")
     else:
         if args.kl_estimator not in ["k1"]:
             print(f"Recommend setting {args.kl_estimator} to 'k1' when not using KL as a loss.")
@@ -162,6 +166,8 @@ def train(args):
     refs = []
     if ref_model is not None:
         refs.extend(ref_model.async_init_model_from_pretrained(strategy, args.pretrain))
+        # refs.extend(ref_model.async_init_model_from_pretrained(strategy, '../Qwen2.5-3B'))
+    
     refs.extend(actor_model.async_init_model_from_pretrained(strategy, args.pretrain))
     if not args.remote_rm_url:
         for reward_model, reward_pretrain in zip(reward_models, reward_pretrains):
@@ -329,7 +335,7 @@ if __name__ == "__main__":
         "--kl_estimator",
         type=str,
         default="k1",
-        choices=["k1", "k2", "k3"],
+        choices=["k1", "k2", "k3","k4"],
         help=(
             "In GRPO, k3 is utilized as the loss function, while k2, when used as the loss, is nearly equivalent to k1."
         ),

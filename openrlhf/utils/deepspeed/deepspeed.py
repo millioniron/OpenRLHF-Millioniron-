@@ -61,6 +61,7 @@ class DeepspeedStrategy(ABC):
         self.grad_accum_dtype = getattr(args, "grad_accum_dtype", None)
         # overlap_comm
         self.overlap_comm = getattr(args, "overlap_comm", False)
+        self.torch_compile = getattr(args, "torch_compile", False)
 
         self.is_rlhf = False
         self.time_steps = defaultdict(int)

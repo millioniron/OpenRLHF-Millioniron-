@@ -179,7 +179,6 @@ class Actor(nn.Module):
         state_seq = sequences[:, input_len - 1 : -1]
         action_mask = state_seq.ne(eos_token_id) & state_seq.ne(pad_token_id)
         action_mask[:, 0] = 1
-
         return sequences, attention_mask, action_mask
 
     def forward(

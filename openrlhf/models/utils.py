@@ -44,7 +44,15 @@ def compute_approx_kl(
             log_ratio = log_ratio * action_mask
         log_ratio = -log_ratio
         log_ratio = log_ratio.exp() - 1 - log_ratio
-
+    #https://github.com/OpenRLHF/OpenRLHF/issues/525
+    if kl_estimator == "k4":
+        log_ratio = log_probs.float() - log_probs_base.float()
+        if action_mask is not None:
+            log_ratio = log_ratio * action_mask
+        
+        log_ratio = -log_ratio
+        k4_log_ratio = log_ratio.exp() - 1 - log_ratio
+        log_ratio = torch.where(log_ratio < 0, k4_log_ratio, torch.min(log_ratio, k4_log_ratio))
     return log_ratio
 
 
@@ -106,10 +114,16 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.T
     return log_probs_labels
 
 
-def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None) -> torch.Tensor:
-    if mask is None:
-        return tensor.mean(axis=dim)
-    return (tensor * mask).sum(axis=dim) / mask.sum(axis=dim)
+def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None , all_tokens: int=None) -> torch.Tensor:
+    if all_tokens is None:
+        if mask is None:
+            return tensor.mean(axis=dim)
+        return (tensor * mask).sum(axis=dim) / mask.sum(axis=dim)
+    else:
+        if mask is None:
+            return tensor.sum(axis=dim)/all_tokens
+        return (tensor * mask).sum(axis=dim) / all_tokens
+    
 
 
 def masked_normalize(tensor: torch.Tensor, mask: torch.Tensor, dim: int = 1, eps: float = 1e-8) -> torch.Tensor:

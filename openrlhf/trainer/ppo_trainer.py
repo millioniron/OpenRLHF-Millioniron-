@@ -2,6 +2,7 @@ import os
 import os.path
 from abc import ABC
 from typing import Any, Callable, Dict, List, Optional
+import numpy
 
 import torch
 import torch.nn as nn
@@ -159,9 +160,9 @@ class PPOTrainer(ABC):
         # wandb/tensorboard setting
         self._wandb = None
         self._tensorboard = None
+        self.replay_buffer_all_tokens=None
         if self.strategy.args.use_wandb and self.strategy.is_rank_0():
             import wandb
-
             self._wandb = wandb
             if not wandb.api.api_key:
                 wandb.login(key=strategy.args.use_wandb)
@@ -241,6 +242,7 @@ class PPOTrainer(ABC):
 
                 if self.args.advantage_estimator != "group_norm":
                     self.replay_buffer.normalize("advantages", self.strategy)
+                self.replay_buffer_all_tokens=self.replay_buffer.cal_all_tokens()
                 status = self.ppo_train(steps)
                 self.replay_buffer.clear()
 
@@ -270,11 +272,13 @@ class PPOTrainer(ABC):
             drop_last=True,
             pin_memory=self.dataloader_pin_memory,
             collate_fn=self.replay_buffer.collate_fn,
-        )
+        ) 
         device = torch.cuda.current_device()
 
         status_list = []
         status_mean = {}
+        corr_length_list=[]
+        incorr_length_list=[]
         for epoch in range(self.max_epochs):
             pbar = tqdm(
                 dataloader,
@@ -283,8 +287,9 @@ class PPOTrainer(ABC):
             )
             for experience in pbar:
                 experience.to_device(device)
-                status = self.training_step(experience, global_steps)
-
+                status,corr_length,incorr_length= self.training_step(experience, global_steps)
+                corr_length_list.extend(corr_length)
+                incorr_length_list.extend(incorr_length)
                 # for DP
                 # weighted mean for kl
                 if "kl" in status:
@@ -303,8 +308,8 @@ class PPOTrainer(ABC):
                         "tlen": status["total_length"],
                         "kl": status["kl"],
                         "act_lr": status["actor_lr"],
+                        "entropy":status["entropy"],
                     }
-
                 if "critic_loss" in status:
                     short_status["cri"] = status["critic_loss"]
                     short_status["vals"] = status["values"]
@@ -323,16 +328,18 @@ class PPOTrainer(ABC):
                     status_mean[k] += v
             for k in status_mean.keys():
                 status_mean[k] /= len(status_list)
+        status_mean['corr_length']=torch.tensor(corr_length_list).mean().item()
+        status_mean['incorr_length']=torch.tensor(incorr_length_list).mean().item()
         torch.cuda.empty_cache()
         return status_mean
 
     def training_step(self, experience: Experience, global_steps) -> Dict[str, float]:
         status = {}
         if global_steps > self.freezing_actor_steps:
-            status = self.training_step_actor(experience)
+            status,corr_length,incorr_length = self.training_step_actor(experience)
         if self.critic is not None:
             status.update(self.training_step_critic(experience))
-        return status
+        return status,corr_length,incorr_length 
 
     def training_step_actor(self, experience: Experience) -> Dict[str, float]:
         self.actor.train()
@@ -393,8 +400,44 @@ class PPOTrainer(ABC):
             old_action_log_probs,
             advantages,
             action_mask=experience.action_mask,
+            all_tokens=self.replay_buffer_all_tokens * self.strategy.train_batch_size /self.strategy.accumulated_gradient / len(self.replay_buffer),
         )
+        
+        
+        
+        with torch.no_grad():
+            assert isinstance(experience.sequences, list), "Only support packed sequences"
+            action_logits = output["logits"][:, :-1, :]
+            action_log_probs_all = torch.nn.functional.log_softmax(action_logits, dim=-1)
 
+            action_log_probs_all_list = []
+            offset = 0
+            for num_action, seq_len in zip(num_actions, packed_seq_lens):
+                start, end = max(0, offset + seq_len - num_action - 1), offset + seq_len - 1
+                action_log_probs_all_list.append(action_log_probs_all[:, start:end])
+                offset += seq_len
+            action_log_probs_all = torch.cat(action_log_probs_all_list, dim=1)
+
+            # Calculate entropy in chunks to avoid OOM
+            chunk_size = 512  # Adjust this value based on your GPU memory
+            num_chunks = (action_log_probs_all.size(1) + chunk_size - 1) // chunk_size
+            entropy_sum = 0
+            total_tokens = 0
+
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, action_log_probs_all.size(1))
+                chunk = action_log_probs_all[:, start_idx:end_idx]
+
+                # Calculate entropy for this chunk
+                chunk_probs = chunk.exp()
+                chunk_entropy = -(chunk_probs * chunk).sum(-1)
+                entropy_sum += chunk_entropy.sum().item()
+                total_tokens += chunk_entropy.numel()
+
+            entropy = entropy_sum / total_tokens
+        
+        
         if self.args.use_kl_loss:
             if self.initial_model is not None:
                 kl = compute_approx_kl(
@@ -457,7 +500,7 @@ class PPOTrainer(ABC):
             self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
 
         # status
-        status = {"policy_loss": actor_loss.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
+        status = {"policy_loss": actor_loss.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0],"entropy": entropy}
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
         for k, v in experience.info.items():
@@ -467,7 +510,10 @@ class PPOTrainer(ABC):
                 ).item()
             else:
                 status[k] = v.mean().item()
-        return status
+            if k== "accuracy_reward":
+                corr_length=experience.info["response_length"][v==1]
+                incorr_length=experience.info["response_length"][v==0]
+        return status,corr_length,incorr_length
 
     def training_step_critic(self, experience: Experience) -> Dict[str, float]:
         self.critic.train()

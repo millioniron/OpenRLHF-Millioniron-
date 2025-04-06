@@ -23,6 +23,8 @@ class BufferItem:
     advantages: (1)
     attention_mask: (S)
     action_mask: (A)
+    r_format:(1)
+    r_accuracy:(1)
 
     "A" is the number of actions.
     """
@@ -32,9 +34,12 @@ class BufferItem:
     base_action_log_probs: torch.Tensor
     values: torch.Tensor
     returns: torch.Tensor
+    r_format: torch.Tensor
+    r_accuracy: torch.Tensor
     advantages: torch.Tensor
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
+    
     info: Optional[dict]
 
 
@@ -50,6 +55,8 @@ def split_experience_batch(experience: Experience) -> List[BufferItem]:
         "advantages",
         "attention_mask",
         "action_mask",
+        "r_format",
+        "r_accuracy",
     )
     for key in keys:
         value = getattr(experience, key)
@@ -101,6 +108,8 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
         "advantages",
         "attention_mask",
         "action_mask",
+        "r_format",
+        "r_accuracy",
     )
     for key in keys:
         vals = [getattr(item, key) for item in items]
@@ -119,7 +128,7 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
 
 def remove_padding_in_sequences(items):
     for item in items:
-        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask = (
+        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask ,r_format,r_accuracy= (
             item.sequences,
             item.action_log_probs,
             item.base_action_log_probs,
@@ -128,6 +137,8 @@ def remove_padding_in_sequences(items):
             item.advantages,
             item.attention_mask,
             item.action_mask,
+            item.r_format,
+            item.r_accuracy,
         )
         right_pad = (1 - act_mask.long()).sum()
         right_pad = None if right_pad == 0 else -right_pad
@@ -143,6 +154,9 @@ def remove_padding_in_sequences(items):
             item.advantages,
             item.attention_mask,
             item.action_mask,
+            item.r_format,
+            item.r_accuracy,
+            
         ) = (
             seq[left_pad:right_pad],
             act_log_prob[:right_pad],
@@ -152,6 +166,8 @@ def remove_padding_in_sequences(items):
             adv[:right_pad],
             att_mask[left_pad:right_pad],
             act_mask[:right_pad],
+            r_format[:right_pad],
+            r_accuracy[:right_pad],
         )
     return items
 
@@ -194,6 +210,15 @@ class NaiveReplayBuffer(ABC):
     def clear(self) -> None:
         self.items.clear()
 
+
+    def cal_all_tokens(self) -> None:
+        if self.items[0].action_mask is None:
+            action_log_probs_list = [item.action_log_probs for item in self.items]
+            return torch.cat(action_log_probs_list, dim=0).unsqueeze(0).shape[-1]
+        else:
+            action_mask_list = [item.action_mask for item in self.items]
+            return torch.cat(action_mask_list, dim=0).unsqueeze(0).sum[-1]
+    
     @torch.no_grad()
     def sample(self) -> Experience:
         items = random.sample(self.items, self.sample_batch_size)

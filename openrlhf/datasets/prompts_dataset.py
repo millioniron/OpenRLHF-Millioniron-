@@ -2,17 +2,38 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 
+# SYSTEM_PROMPT = (
+#     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+#     "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+#     "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
+#     "<think> reasoning process here </think><answer> answer here </answer><|endoftext|>"
+# )
+SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
+    "<think> reasoning process here </think><answer> answer here </answer>"
+)
+
+
+
 def preprocess_data(data, input_template=None, input_key="input", label_key=None, apply_chat_template=None) -> str:
     if apply_chat_template:
         chat = data[input_key]
         if isinstance(chat, str):
-            chat = [{"role": "user", "content": chat}]
+            # chat = [
+            #     {"role": "system", "content": SYSTEM_PROMPT},
+            #     {"role": "user", "content": chat+"Please put your final answer within \\boxed{}."}]                
+            #     # {"role": "user", "content": chat}]
+            chat = [
+                {"role": "user", "content": chat+"Please reason step by step, and put your final answer within \\boxed{}."}]                
+                # {"role": "user", "content": chat}]
         prompt = apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
     else:
         prompt = data[input_key]
         if input_template:
             prompt = input_template.format(prompt)
-
+    # print(prompt[0])
     # for Reinforced Fine-tuning
     label = "" if label_key is None else data[label_key]
     return prompt, label

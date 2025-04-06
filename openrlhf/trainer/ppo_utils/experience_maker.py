@@ -47,10 +47,11 @@ class Experience:
     attention_mask: (B, S)
     action_mask: (B, A)
     kl: (B, A)
+    r_format: (B, A)
+    r_accuracy: (B, A)
 
     "A" is the number of actions.
     """
-
     sequences: torch.Tensor
     action_log_probs: torch.Tensor
     base_action_log_probs: torch.Tensor
@@ -60,6 +61,8 @@ class Experience:
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
     info: Optional[dict]
+    r_format: Optional[torch.Tensor]
+    r_accuracy: Optional[torch.Tensor]
     kl: Optional[torch.Tensor] = None
 
     @torch.no_grad()
@@ -74,6 +77,8 @@ class Experience:
         self.action_mask = to(self.action_mask, device)
         self.kl = to(self.kl, device)
         self.info = {key: to(value, device) for key, value in self.info.items()}
+        self.r_format=to(self.r_format, device)
+        self.r_accuracy=to(self.r_accuracy, device)
         return self
 
     def pin_memory(self):
@@ -87,6 +92,8 @@ class Experience:
         self.action_mask = pin_memory(self.action_mask)
         self.kl = pin_memory(self.kl)
         self.info = {key: pin_memory(value) for key, value in self.info.items()}
+        self.r_format=pin_memory(self.r_format)
+        self.r_accuracy=pin_memory(self.r_accuracy)
         return self
 
 
@@ -207,6 +214,9 @@ class NaiveExperienceMaker(ABC):
             from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
 
             batch_vllm_engine_call(self.vllm_engines, "wake_up")
+            
+            time.sleep(1)
+            
             torch.distributed.barrier()
             torch.cuda.synchronize()
 
@@ -359,7 +369,7 @@ class NaiveExperienceMaker(ABC):
         # rewards
         if self.remote_rm_url is not None:
             # remote RM
-            queries = self.tokenizer.batch_decode(sequences.cpu(), skip_special_tokens=False)
+            queries = self.tokenizer.batch_decode(sequences.cpu(), skip_special_tokens=True)
             if self.custom_reward_func:
                 r = self.custom_reward_func(queries, samples.prompts, samples.labels).to(
                     device=action_log_probs.device
@@ -382,6 +392,10 @@ class NaiveExperienceMaker(ABC):
         else:
             kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
 
+
+        r_format=r[1]
+        r_accuracy=r[2]
+        r=r[0]
         info = {
             "kl": masked_mean(kl, action_mask, dim=-1),
             "reward": r,
@@ -389,6 +403,23 @@ class NaiveExperienceMaker(ABC):
             "total_length": samples.total_length,
             "num_actions": num_actions,
         }
+        
+        # 检查并添加'r_format'，如果它存在的话
+        if 'r_format' in locals() or 'r_format' in globals():
+            info["format_reward"] = r_format
+        else:
+            # 或者你可以选择给它一个默认值，例如None
+            info["format_reward"] = None
+
+        # 对'r_accuracy'做同样的处理
+        if 'r_accuracy' in locals() or 'r_accuracy' in globals():
+            info["accuracy_reward"] = r_accuracy
+        else:
+            # 或者你可以选择给它一个默认值，例如None
+            info["accuracy_reward"] = None
+        
+        
+        
         # reset model state
         self.actor.train()
         if self.critic is not None:
@@ -404,7 +435,10 @@ class NaiveExperienceMaker(ABC):
             attention_mask,
             action_mask,
             info,
+            r_format,
+            r_accuracy,
             kl,
+            
         )
 
     @torch.no_grad()
@@ -437,6 +471,7 @@ class NaiveExperienceMaker(ABC):
             rewards = torch.cat([experience.info["reward"] for experience in experiences])
             rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
             rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            # rewards = (rewards - rewards.mean(-1, keepdim=True))
             rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
             return experiences, rewards
         # default rewards
@@ -540,8 +575,7 @@ class NaiveExperienceMaker(ABC):
         # Calculate returns by accumulating discounted rewards
         for t in reversed(range(response_length)):
             cumulative_return = rewards[:, t] + gamma * cumulative_return
-            returns[:, t] = cumulative_return
-
+            returns[:, t] = cumulative_return      
         return returns
 
 
@@ -647,7 +681,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         else:
             # remote RM
             if not self.packing_samples:
-                queries = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=False)
+                queries = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=True)
             else:
                 sequences_list = []
                 offset = 0
@@ -655,10 +689,10 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 for length in packed_seq_lens:
                     sequences_list.append(tokens_list[offset : offset + length])
                     offset += length
-                queries = self.tokenizer.batch_decode(sequences_list, skip_special_tokens=False)
+                queries = self.tokenizer.batch_decode(sequences_list, skip_special_tokens=True)
 
             if self.custom_reward_func:
-                r = self.custom_reward_func.remote(queries, samples.prompts, samples.labels)
+                r= self.custom_reward_func.remote(queries, samples.prompts, samples.labels)
                 r_refs.append(r)
             else:
                 for rm in self.remote_rm_url:
@@ -741,7 +775,11 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
         if not args.use_kl_loss:
             base_action_log_probs = None
-
+            
+        r_format=r[1]
+        r_accuracy=r[2]
+        r=r[0]
+        
         info = {
             "kl": kl_mean,
             "reward": r,
@@ -749,6 +787,20 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             "total_length": samples.total_length,
             "num_actions": num_actions,
         }
+        
+        # 检查并添加'r_format'，如果它存在的话
+        if 'r_format' in locals() or 'r_format' in globals():
+            info["format_reward"] = r_format
+        else:
+            # 或者你可以选择给它一个默认值，例如None
+            info["format_reward"] = None
+
+        # 对'r_accuracy'做同样的处理
+        if 'r_accuracy' in locals() or 'r_accuracy' in globals():
+            info["accuracy_reward"] = r_accuracy
+        else:
+            # 或者你可以选择给它一个默认值，例如None
+            info["accuracy_reward"] = None
 
         if self.strategy.args.perf:
             self.perf_stats["actor_value_rm_time"] += actor_value_rm_time
@@ -764,6 +816,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             attention_mask,
             action_mask,
             info,
+            r_format,
+            r_accuracy,
             kl,
         )
 
@@ -791,7 +845,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             top_k=kwargs.get("top_k", -1),
             max_tokens=kwargs.get("max_new_tokens", 1024),
             min_tokens=kwargs.get("min_new_tokens", 1),
-            skip_special_tokens=kwargs.get("skip_special_tokens", False),
+            skip_special_tokens=kwargs.get("skip_special_tokens", True),
             include_stop_str_in_output=True,
         )
 
