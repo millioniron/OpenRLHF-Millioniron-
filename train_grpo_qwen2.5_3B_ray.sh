@@ -1,7 +1,7 @@
 export CUDA_VISIBLE_DEVICES=0,1
 
 # 1. 清理环境
-# ray stop --force
+ray stop --force
 
 # 在容器中启动 Ray 的主节点
 RAY_memory_monitor_refresh_ms=0 ray start --head --node-ip-address 0.0.0.0 --num-gpus 2 --port 9545
