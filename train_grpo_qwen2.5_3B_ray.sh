@@ -52,7 +52,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --save_steps 133 \
    --ckpt_path openrlhf/examples/test_scripts/ckpt/Qwen2.5-3B-MATH8k-Train_batch512-rollout_batch64-n_samples_per_prompt=8_lr3e-6_kl=1e-3_replace_onpolicy_grpo_k2-0__noformat \
    --flash_attn \
-   --use_wandb 59fa28cc43cac480c8f856677e3370bd423292c5 \
+   --use_wandb {} \
    --colocate_actor_ref  \
    --num_episodes 2 \
    --wandb_project MATH-8k \
