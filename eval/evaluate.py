@@ -68,14 +68,15 @@ def evaluate(data_name, prompt_type, samples: list=None, file_path: str=None, ma
 
     # output mean of each column of scores
     col_means= np.array(score_mat).mean(axis=0)
+    print("col_means", col_means)
     mean_score = list(np.round(col_means * 100, decimals=1))
-
+    print("mean_score", mean_score)
     result_json = {
         "num_samples": len(samples),
         "num_scores": len(scores),
         "timeout_samples": timeout_cnt,
         "empty_samples": len([s for s in samples if not s['pred'][-1]]),
-        "acc": mean_score[0]
+        "acc": sum(mean_score)/len(mean_score)
     }
 
     # each type score
@@ -107,3 +108,4 @@ if __name__ == "__main__":
     args = parse_args()
     evaluate(data_name=args.data_name, prompt_type=args.prompt_type, file_path=args.file_path,
              max_num_samples=args.max_num_samples, execute=args.execute)
+

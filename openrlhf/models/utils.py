@@ -133,7 +133,8 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor, temperatur
     return log_probs_labels
 
 
-def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None , all_tokens: int=None) -> torch.Tensor:
+def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None , all_tokens: int=None ,num_actions=None ) -> torch.Tensor:
+    
     if all_tokens is None:
         if mask is None:
             return tensor.mean(axis=dim)

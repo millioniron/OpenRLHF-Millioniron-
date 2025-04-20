@@ -5,38 +5,7 @@ import torch
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
-# def reward_func(queries, prompts, labels):
-    
-#     responses = []
-    
-#     for query, prompt in zip(queries, prompts):
-#         # 假设prompt是query的前缀，我们通过查找prompt在query中的位置来截取response
-#         prompt_end_index = len(prompt)
-#         response = query[prompt_end_index:].strip()  # 去除前后空白字符
-#         responses.append(response)
-    
-#     print('-'*100)
-#     print(prompts[0])
-#     print("-"*100)
-#     print(queries[0])
-#     print("-"*100)
-#     print(responses[0])
-#     print("-"*100)
-#     print(labels[0])
-
-    
-#     format_rewards = format_reward(responses)
-#     accuracy_rewards = accuracy_reward(responses, labels)
-#     rewards = [accuracy_reward+format_reward for format_reward, accuracy_reward in zip(format_rewards, accuracy_rewards)]
-    
-#     print('-'*100)
-#     print('\n ALL rewards:',rewards)
-#     # print('-'*100)
-#     # print(responses[0])
-    
-#     return torch.tensor([rewards,format_rewards,accuracy_rewards])
-
-def reward_func(queries, prompts, labels):
+def reward_func(queries, prompts, labels,responses_lengths,**kwargs):
     
     responses = []
     
@@ -58,15 +27,62 @@ def reward_func(queries, prompts, labels):
     
     format_rewards = format_reward(responses)
     accuracy_rewards = accuracy_reward(responses, labels)
-    rewards = [accuracy_reward+format_reward for format_reward, accuracy_reward in zip(format_rewards, accuracy_rewards)]
-    # rewards = [accuracy_reward for format_reward, accuracy_reward in zip(format_rewards, accuracy_rewards)]
-
-    # print('-'*100)
-    # print('\n ALL rewards:',rewards)
-    # print('-'*100)
-    # print(responses[0])
     
-    return torch.tensor([rewards,format_rewards,accuracy_rewards])
+    
+    ##add overlong filtering
+    
+    overlong_rewards=[(5096 - 1000- response_length) / 1000 if response_length > 5096 - 1000 else 0 for response_length in responses_lengths]
+    # overlong_rewards=[(4096 - 1000- len(response)) / 1000  if len(response) > 4096 - 1000 else 0 for response in responses]
+
+    
+    # print(responses_length)
+    # print([len(response) for response in responses])
+    
+    # print(overlong_rewards)
+    
+    # 计算最终奖励（假设 format_rewards 和 accuracy_rewards 已存在）
+    rewards = [
+        format_r + accuracy_r + overlong_r
+        for format_r, accuracy_r, overlong_r in zip(
+            format_rewards,
+            accuracy_rewards,
+            overlong_rewards
+        )
+    ]
+
+    return torch.tensor([rewards,format_rewards,accuracy_rewards,overlong_rewards])
+
+# def reward_func(queries, prompts, labels):
+    
+#     responses = []
+    
+#     for query in queries:
+#         # 查找 "assistant\n" 在 query 中的位置
+#         assistant_index = query.find("assistant\n")
+#         if assistant_index != -1:
+#             # 计算 "assistant\n" 后面内容的起始位置
+#             response_start_index = assistant_index + len("assistant\n")
+#             # 提取从 response_start_index 开始到结尾的字符串，并去除前后空白字符
+#             response = query[response_start_index:].strip()
+#             # 将提取出的 response 添加到 responses 列表中
+#             responses.append(response)
+#         else:
+#             # 如果没有找到 "assistant\n"，可以选择抛出错误、警告或者跳过
+#             # 这里我们选择跳过该 query 或者可以给一个默认值
+#             responses.append("")  # 或者使用 pass 跳过
+
+    
+#     format_rewards = format_reward(responses)
+#     accuracy_rewards = accuracy_reward(responses, labels)
+#     rewards = [accuracy_reward+format_reward for format_reward, accuracy_reward in zip(format_rewards, accuracy_rewards)]
+#     # rewards = [accuracy_reward for format_reward, accuracy_reward in zip(format_rewards, accuracy_rewards)]
+
+#     # print('-'*100)
+#     # print('\n ALL rewards:',rewards)
+#     # print('-'*100)
+#     # print(responses[0])
+    
+#     return torch.tensor([rewards,format_rewards,accuracy_rewards])
 
 
 

@@ -61,7 +61,6 @@ class PolicyLoss(nn.Module):
     def __init__(self, clip_eps: float = 0.2) -> None:
         super().__init__()
         self.clip_eps = clip_eps
-
     def forward(
         self,
         log_probs: torch.Tensor,
@@ -69,14 +68,15 @@ class PolicyLoss(nn.Module):
         advantages: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
         all_tokens:  int = None,
+        num_actions = None,
     ) -> torch.Tensor:
-        # ratio = (log_probs - old_log_probs).exp()
-        ratio = (log_probs - log_probs.detach()).exp()
+        ratio = (log_probs - old_log_probs).exp()
+        # ratio = (log_probs - log_probs.detach()).exp()
         print(ratio.mean())
         surr1 = ratio * advantages
-        surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
+        surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps+0.08) * advantages
         loss = -torch.min(surr1, surr2)
-        loss = masked_mean(loss, action_mask, all_tokens=all_tokens,dim=-1).mean()
+        loss = masked_mean(loss, action_mask, all_tokens=all_tokens,dim=-1,num_actions=num_actions).mean()
         # loss=loss.sum(axis=-1).mean()/3000
         return loss
 

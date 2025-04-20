@@ -3,7 +3,7 @@ import os.path
 from abc import ABC
 from typing import Any, Callable, Dict, List, Optional
 import numpy
-
+import time
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -218,6 +218,7 @@ class PPOTrainer(ABC):
         start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
         consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
 
+        start_time=time.time()
         for episode in range(start_episode, args.num_episodes):
             if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
                 self.prompts_dataloader.sampler.set_epoch(
@@ -229,6 +230,11 @@ class PPOTrainer(ABC):
                 disable=not self.strategy.is_rank_0(),
             )
 
+            not_enough_attempts = 0
+            max_attempts = 3  # Maximum number of attempts to get enough samples
+            
+            
+            
             for rand_prompts, labels in self.prompts_dataloader:
                 for i, experience in enumerate(
                     self.experience_maker.make_experience_list(rand_prompts, labels, **self.generate_kwargs)
@@ -239,15 +245,31 @@ class PPOTrainer(ABC):
                         )
                         self.strategy.print(output)
                     self.replay_buffer.append(experience)
-
-                if self.args.advantage_estimator != "group_norm":
+                if not_enough_attempts < max_attempts:
+                    self.replay_buffer.filter(self.strategy)
+                if (len(self.replay_buffer) < args.rollout_batch_size*args.n_samples_per_prompt) and (not_enough_attempts < max_attempts):
+                    self.strategy.print(f"Replay buffer is not enough, attempt {not_enough_attempts}/{max_attempts}")
+                    not_enough_attempts += 1
+                    continue
+                not_enough_attempts=0
+                self.replay_buffer.items = self.replay_buffer.items[:args.rollout_batch_size*args.n_samples_per_prompt]
+                
+                if self.args.advantage_estimator not in ["group_norm","dr_grpo"]:
                     self.replay_buffer.normalize("advantages", self.strategy)
-                self.replay_buffer_all_tokens=self.replay_buffer.cal_all_tokens()
+                
+                if self.args.advantage_estimator not in ["dr_grpo"]:
+                    self.replay_buffer_all_tokens=self.replay_buffer.cal_all_tokens()
+                    self.replay_buffer_all_tokens=self.strategy.all_reduce(self.replay_buffer_all_tokens,"sum")
+                    self.replay_buffer_all_tokens * self.strategy.train_batch_size /self.strategy.accumulated_gradient / len(self.replay_buffer)
+                else:
+                    self.replay_buffer_all_tokens=3000
+                
                 status = self.ppo_train(steps)
                 self.replay_buffer.clear()
 
                 if "kl" in status:
                     self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
+                status['time']=time.time()-start_time
                 pbar.set_postfix(status)
 
                 # logs/checkpoints
@@ -310,6 +332,15 @@ class PPOTrainer(ABC):
                         "act_lr": status["actor_lr"],
                         "entropy":status["entropy"],
                     }
+                if "r_format" in status:
+                    short_status["r_format"] = status["r_format"]
+                if "r_accuracy" in status:
+                    short_status["r_accuracy"] = status["r_accuracy"]
+                if "r_std" in status:
+                    short_status["r_std"] = status["r_std"]
+                if "r_mean" in status:
+                    short_status["r_mean"] = status["r_mean"]
+                    
                 if "critic_loss" in status:
                     short_status["cri"] = status["critic_loss"]
                     short_status["vals"] = status["values"]
@@ -393,17 +424,14 @@ class PPOTrainer(ABC):
                 action_log_probs=action_log_probs,
                 ring_attn_group=self.strategy.ring_attn_group,
             )
-
         # loss function
         actor_loss = self.actor_loss_fn(
             action_log_probs,
             old_action_log_probs,
             advantages,
             action_mask=experience.action_mask,
-            all_tokens=self.replay_buffer_all_tokens * self.strategy.train_batch_size /self.strategy.accumulated_gradient / len(self.replay_buffer),
-        )
-        
-        
+            all_tokens=self.replay_buffer_all_tokens,
+            num_actions=None,)
         
         with torch.no_grad():
             assert isinstance(experience.sequences, list), "Only support packed sequences"

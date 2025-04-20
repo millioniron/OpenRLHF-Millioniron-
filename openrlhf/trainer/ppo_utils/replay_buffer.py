@@ -2,6 +2,8 @@ import random
 from abc import ABC
 from dataclasses import dataclass
 from typing import List, Optional
+import numpy as np
+from numpy import mean
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +27,8 @@ class BufferItem:
     action_mask: (A)
     r_format:(1)
     r_accuracy:(1)
+    r_std:(1)
+    r_mean:(1)
 
     "A" is the number of actions.
     """
@@ -36,6 +40,8 @@ class BufferItem:
     returns: torch.Tensor
     r_format: torch.Tensor
     r_accuracy: torch.Tensor
+    r_std: torch.Tensor
+    r_mean: torch.Tensor
     advantages: torch.Tensor
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
@@ -57,6 +63,8 @@ def split_experience_batch(experience: Experience) -> List[BufferItem]:
         "action_mask",
         "r_format",
         "r_accuracy",
+        "r_std",
+        "r_mean",
     )
     for key in keys:
         value = getattr(experience, key)
@@ -110,6 +118,8 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
         "action_mask",
         "r_format",
         "r_accuracy",
+        "r_std",
+        "r_mean",
     )
     for key in keys:
         vals = [getattr(item, key) for item in items]
@@ -128,7 +138,7 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
 
 def remove_padding_in_sequences(items):
     for item in items:
-        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask ,r_format,r_accuracy= (
+        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask ,r_format,r_accuracy,r_std,r_mean= (
             item.sequences,
             item.action_log_probs,
             item.base_action_log_probs,
@@ -139,6 +149,8 @@ def remove_padding_in_sequences(items):
             item.action_mask,
             item.r_format,
             item.r_accuracy,
+            item.r_std,
+            item.r_mean,
         )
         right_pad = (1 - act_mask.long()).sum()
         right_pad = None if right_pad == 0 else -right_pad
@@ -156,10 +168,12 @@ def remove_padding_in_sequences(items):
             item.action_mask,
             item.r_format,
             item.r_accuracy,
+            item.r_std,
+            item.r_mean,
             
         ) = (
             seq[left_pad:right_pad],
-            act_log_prob[:right_pad],
+            act_log_prob[:right_pad] if item.action_log_probs is not None else None,
             base_act_log_prob[:right_pad] if item.base_action_log_probs is not None else None,
             value[:right_pad] if item.values is not None else None,
             ret[:right_pad],
@@ -168,6 +182,8 @@ def remove_padding_in_sequences(items):
             act_mask[:right_pad],
             r_format[:right_pad],
             r_accuracy[:right_pad],
+            r_std[:right_pad],
+            r_mean[:right_pad],
         )
     return items
 
@@ -232,7 +248,16 @@ class NaiveReplayBuffer(ABC):
 
     def __getitem__(self, idx: int) -> BufferItem:
         return self.items[idx]
-
+    
+    def filter(self) -> None:
+        
+        filtered_count = sum(1 for item in self.items if item.r_std <= 0) 
+        self.items = [item for item in self.items if item.r_std > 0]
+        print("****************"*5)
+        print('filtered_count:',filtered_count)
+        
+        return filtered_count
+        
     def collate_fn(self, batch) -> Experience:
         experience = make_experience_batch(batch, self.packing_samples)
         return experience
