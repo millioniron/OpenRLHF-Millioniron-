@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 
 from .experience_maker import Experience
+from torch.distributed import all_gather_object
 
 
 @dataclass
@@ -249,14 +250,38 @@ class NaiveReplayBuffer(ABC):
     def __getitem__(self, idx: int) -> BufferItem:
         return self.items[idx]
     
-    def filter(self) -> None:
+    def filter(self,strategy) -> None:
+
+            # 收集所有GPU上的self.items
+        gathered_items = [[] for _ in range(strategy.world_size)]
+        all_gather_object(gathered_items, self.items)
         
-        filtered_count = sum(1 for item in self.items if item.r_std <= 0) 
+        # 合并列表
+        aggregated_items = []
+        for sublist in gathered_items:
+            aggregated_items.extend(sublist)
+        
+        self.items = aggregated_items
+        
+        # print("****************"*5)
+        # print('items_count:',len(self.items))
+        
+        filtered_count = sum(1 for item in self.items if item.r_std <= 0)
+        
         self.items = [item for item in self.items if item.r_std > 0]
-        print("****************"*5)
-        print('filtered_count:',filtered_count)
         
-        return filtered_count
+
+        # print("****************"*5)
+        # print('filtered_count:',filtered_count)
+        # print("****************"*5)
+        # print(strategy.world_size)
+        
+        
+        chunk_size = len(self.items) // strategy.world_size
+        
+        self.items = self.items[strategy.get_rank() * chunk_size : (strategy.get_rank() + 1) * chunk_size]
+        # print("****************"*5)
+        # print('filtered_items_count:',len(self.items))
         
     def collate_fn(self, batch) -> Experience:
         experience = make_experience_batch(batch, self.packing_samples)
