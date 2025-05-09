@@ -354,7 +354,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--advantage_estimator",
         type=str,
-        choices=["gae", "reinforce", "rloo", "reinforce_baseline", "group_norm",'dr_grpo'],
+        choices=["gae", "reinforce", "rloo", "reinforce_baseline", "group_norm", 'dr_grpo'],
         default="gae",
         help="Choose advantage estimation method: gae, reinforce, rloo, reinforce_baseline, group_norm,dr_grpo",
     )

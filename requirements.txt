@@ -20,3 +20,5 @@ transformers==4.48.3
 transformers_stream_generator
 wandb
 wheel
+latex2sympy2_extended
+math_verify

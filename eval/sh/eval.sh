@@ -58,11 +58,7 @@ echo "All tests completed."
 # set -ex
 # export CUDA_VISIBLE_DEVICES=1
 
-
-
 # # PROMPT_TYPE="qwen25-math-cot"
-
-
 # PROMPT_TYPE="qwen-boxed"
 
 
@@ -74,7 +70,6 @@ echo "All tests completed."
 
 # # MODEL_NAME_OR_PATH="/Data/gz/Qwen2.5-3B-MATH8k-Train_batch256-rollout_batch64-n_samples_per_prompt=8_lr5e-7_kl=0_onpolicy_dr_grpo_k2_noformat_wstd_deter/global_step10_hf"
 
-
 # OUTPUT_DIR="./output"
 
 # SPLIT="test"
@@ -83,7 +78,6 @@ echo "All tests completed."
 # # English open datasets
 # # DATA_NAME="gsm8k,math500,minerva_math,gaokao2023en,olympiadbench,college_math,aime24,amc23"
 # DATA_NAME="math500,aime24,gaokao2023en,amc23,minerva_math,olympiadbench"
-# # DATA_NAME="aime24"
 # # DATA_NAME="minerva_math,olympiadbench"
 
 # TOKENIZERS_PARALLELISM=false \
@@ -94,7 +88,7 @@ echo "All tests completed."
 #     --split ${SPLIT} \
 #     --prompt_type ${PROMPT_TYPE} \
 #     --num_test_sample ${NUM_TEST_SAMPLE} \
-#     --max_tokens_per_call 8192 \
+#     --max_tokens_per_call 5096 \
 #     --seed 0 \
 #     --temperature 0 \
 #     --n_sampling 1 \
@@ -103,8 +97,6 @@ echo "All tests completed."
 #     --end -1 \
 #     --use_vllm \
 #     --save_outputs 
-
-
 
 # # English multiple-choice datasets
 # DATA_NAME="aqua,sat_math,mmlu_stem"
