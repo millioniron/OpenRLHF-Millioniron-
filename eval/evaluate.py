@@ -108,4 +108,3 @@ if __name__ == "__main__":
     args = parse_args()
     evaluate(data_name=args.data_name, prompt_type=args.prompt_type, file_path=args.file_path,
              max_num_samples=args.max_num_samples, execute=args.execute)
-

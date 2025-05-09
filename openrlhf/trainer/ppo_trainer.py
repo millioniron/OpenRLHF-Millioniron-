@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from openrlhf.models import Actor, GPTLMLoss, PolicyLoss, ValueLoss
 from openrlhf.models.ring_attn_utils import pad_sequences, unpad_sequences
-from openrlhf.models.utils import compute_approx_kl, masked_mean, unpacking_samples
+from openrlhf.models.utils import compute_approx_kl, masked_mean
 from openrlhf.utils.distributed_sampler import DistributedSampler
 
 from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveExperienceMaker, NaiveReplayBuffer
@@ -260,10 +260,10 @@ class PPOTrainer(ABC):
                 if self.args.advantage_estimator not in ["dr_grpo"]:
                     self.replay_buffer_all_tokens=self.replay_buffer.cal_all_tokens()
                     self.replay_buffer_all_tokens=self.strategy.all_reduce(self.replay_buffer_all_tokens,"sum")
-                    self.replay_buffer_all_tokens * self.strategy.train_batch_size /self.strategy.accumulated_gradient / len(self.replay_buffer)
+                    self.replay_buffer_all_tokens*=self.strategy.train_batch_size /self.strategy.accumulated_gradient / len(self.replay_buffer)
                 else:
-                    self.replay_buffer_all_tokens=3000
-                
+                    self.replay_buffer_all_tokens=self.args.generate_max_len*self.strategy.train_batch_size /self.strategy.accumulated_gradient
+		
                 status = self.ppo_train(steps)
                 self.replay_buffer.clear()
 
@@ -340,7 +340,7 @@ class PPOTrainer(ABC):
                     short_status["r_std"] = status["r_std"]
                 if "r_mean" in status:
                     short_status["r_mean"] = status["r_mean"]
-                    
+
                 if "critic_loss" in status:
                     short_status["cri"] = status["critic_loss"]
                     short_status["vals"] = status["values"]
@@ -424,14 +424,17 @@ class PPOTrainer(ABC):
                 action_log_probs=action_log_probs,
                 ring_attn_group=self.strategy.ring_attn_group,
             )
+
         # loss function
         actor_loss = self.actor_loss_fn(
             action_log_probs,
             old_action_log_probs,
             advantages,
             action_mask=experience.action_mask,
-            all_tokens=self.replay_buffer_all_tokens,
-            num_actions=None,)
+            all_tokens=self.replay_buffer_all_tokens
+        )
+        actor_kl_log = masked_mean(action_log_probs, mask=experience.action_mask, dim=-1).mean()
+        old_actor_kl_log = masked_mean(old_action_log_probs, mask=experience.action_mask, dim=-1).mean()
         
         with torch.no_grad():
             assert isinstance(experience.sequences, list), "Only support packed sequences"
@@ -476,18 +479,9 @@ class PPOTrainer(ABC):
                 )
             else:
                 kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
-
-            if not self.args.packing_samples:
-                kl_mean = masked_mean(kl, experience.action_mask, dim=-1)
-            else:
-                # convert tensor into list of tensors so that it's easier to manipulate
-                # within dataset.
-
-                kl = unpacking_samples(kl, num_actions)
-                kl_mean = torch.tensor([each_kl.mean() for each_kl in kl], device=action_log_probs.device)
-
-            kl_loss = kl_mean.mean()
-            experience.info["kl"] = kl_loss.item()
+                
+            kl_loss = masked_mean(kl, experience.action_mask, dim=-1, all_tokens=self.replay_buffer_all_tokens).mean()
+            experience.info["kl"] = kl_loss
         else:
             kl_loss = 0
 
@@ -528,20 +522,15 @@ class PPOTrainer(ABC):
             self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
 
         # status
-        status = {"policy_loss": actor_loss.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0],"entropy": entropy}
+        status = {"policy_loss": actor_loss.item(), "actor_kl_log":actor_kl_log.item(), "old_actor_kl_log":old_actor_kl_log.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0], "entropy": entropy}
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
         for k, v in experience.info.items():
-            if k == "kl":
-                status[k] = (
-                    (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
-                ).item()
-            else:
-                status[k] = v.mean().item()
+            status[k] = v.mean().item()
             if k== "accuracy_reward":
                 corr_length=experience.info["response_length"][v==1]
                 incorr_length=experience.info["response_length"][v==0]
-        return status,corr_length,incorr_length
+        return status, corr_length, incorr_length
 
     def training_step_critic(self, experience: Experience) -> Dict[str, float]:
         self.critic.train()

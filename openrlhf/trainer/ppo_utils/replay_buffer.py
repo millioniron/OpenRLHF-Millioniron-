@@ -252,7 +252,7 @@ class NaiveReplayBuffer(ABC):
     
     def filter(self,strategy) -> None:
 
-            # 收集所有GPU上的self.items
+		# 收集所有GPU上的self.items
         gathered_items = [[] for _ in range(strategy.world_size)]
         all_gather_object(gathered_items, self.items)
         
