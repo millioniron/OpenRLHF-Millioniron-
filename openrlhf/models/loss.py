@@ -95,9 +95,9 @@ class PolicyLoss(nn.Module):
                 
                 print(f"r_mean value: {r_mean}")
                 
-                ratio = (log_probs - old_log_probs).exp()
+                # ratio = (log_probs - old_log_probs).exp()
                 
-                # ratio = (log_probs - torch.log(torch.exp(log_probs) + (torch.exp(old_log_probs) - torch.exp(log_probs)) * r_mean[0])).exp()
+                ratio = (log_probs - torch.log(torch.exp(log_probs) + (torch.exp(old_log_probs) - torch.exp(log_probs)) * r_mean[0])).exp()
                 print('old_log_probs is 1, this may cause division by zero  ',torch.mean(torch.log(torch.exp(log_probs) + (torch.exp(old_log_probs) - torch.exp(log_probs)) * r_mean[0])))
                 
             else:
