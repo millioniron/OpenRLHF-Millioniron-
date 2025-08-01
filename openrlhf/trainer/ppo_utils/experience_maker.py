@@ -69,8 +69,8 @@ class Experience:
     info: Optional[dict]
     r_format: Optional[torch.Tensor]
     r_accuracy: Optional[torch.Tensor]
-    r_std: Optional[torch.Tensor]=None
     r_mean: Optional[torch.Tensor]=None
+    r_std: Optional[torch.Tensor]=None
     kl: Optional[torch.Tensor]=None
     num_actions: Optional[torch.Tensor] = None
     entropy_old: Optional[torch.Tensor] = None
@@ -113,7 +113,6 @@ class Experience:
         self.info = {key: pin_memory(value) for key, value in self.info.items()}
         self.r_format=pin_memory(self.r_format)
         self.r_accuracy=pin_memory(self.r_accuracy)
-        self.r_std=pin_memory(self.r_std)
         self.r_mean=pin_memory(self.r_mean)
         self.num_actions = pin_memory(self.num_actions)
         self.entropy_old = pin_memory(self.entropy_old)
@@ -384,7 +383,6 @@ class NaiveExperienceMaker(ABC):
 
         # log probs
         action_log_probs = self.actor(sequences, num_actions, attention_mask)
-        # action_log_probs=None
 
         # init log probs
         if self.initial_model is not None:
@@ -527,39 +525,37 @@ class NaiveExperienceMaker(ABC):
         if args.advantage_estimator == "rloo":
             rewards = torch.cat([experience.info["reward"] for experience in experiences])
             rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-        
-            baseline = (rewards.sum(-1, keepdim=True) - rewards) / (args.n_samples_per_prompt - 1) 
+            baseline = (rewards.sum(-1, keepdim=True) - rewards) / (args.n_samples_per_prompt - 1)
             rewards = rewards - baseline
             rewards = rewards.flatten().to(device="cpu").chunk(len(experiences))
             
             
             accuracy_rewards = torch.cat([experience.info["accuracy_reward"] for experience in experiences])
             accuracy_rewards = accuracy_rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-            accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
+            accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             
             
-            for experience, r_std in zip(experiences, accuracy_reward_std.flatten().chunk(len(experiences))):
-                experience.r_std = r_std
-                experience.info['r_std'] = r_std
             for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
                 experience.r_mean = r_mean
                 experience.info['r_mean'] = r_mean
+            for experience, r_std in zip(experiences, accuracy_reward_std.flatten().chunk(len(experiences))):
+                experience.r_std = r_std
+                experience.info['r_std'] = r_std
             return experiences, rewards
         elif args.advantage_estimator == "reinforce_baseline":
             # REINFORCE++-baseline removed the / std and K3 kl loss in GRPO.
             # `/ std` is not needed in RL variance reduction theory, and `k3 KL` has a larger variance than `k1 KL` under a categorical distribution.
             rewards = torch.cat([experience.info["reward"] for experience in experiences])
             rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-
             rewards = rewards - rewards.mean(-1, keepdim=True)
             rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
             
             
             accuracy_rewards = torch.cat([experience.info["accuracy_reward"] for experience in experiences])
             accuracy_rewards = accuracy_rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-            accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
+            accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             
             
             for experience, r_std in zip(experiences, accuracy_reward_std.flatten().chunk(len(experiences))):
@@ -568,35 +564,57 @@ class NaiveExperienceMaker(ABC):
             for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
                 experience.r_mean = r_mean
                 experience.info['r_mean'] = r_mean
-                
-            return experiences, rewards
-        elif args.advantage_estimator == "group_norm":
-            rewards = torch.cat([experience.info["reward"] for experience in experiences])
-            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-
-            rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
-            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
-            
-            
-            
-            accuracy_rewards = torch.cat([experience.info["accuracy_reward"] for experience in experiences])
-            accuracy_rewards = accuracy_rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-            accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
-            accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
-            
-            
             for experience, r_std in zip(experiences, accuracy_reward_std.flatten().chunk(len(experiences))):
                 experience.r_std = r_std
                 experience.info['r_std'] = r_std
-            for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
-                experience.r_mean = r_mean
-                experience.info['r_mean'] = r_mean
             return experiences, rewards
         elif args.advantage_estimator == "dr_grpo":
             rewards = torch.cat([experience.info["reward"] for experience in experiences])
             # print('rewards',rewards)
             rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
             rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            # rewards = (rewards - rewards.mean(-1, keepdim=True))
+            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
+            
+            
+            accuracy_rewards = torch.cat([experience.info["accuracy_reward"] for experience in experiences])
+            
+            
+            accuracy_rewards = accuracy_rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
+            accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
+            
+            # if self.entropy_sft==None and self.entropy_rl==None:
+                
+            #     self.entropy_sft=entropy_list[:,0].mean()
+                
+            #     self.entropy_rl=entropy_list[:,1:].mean()
+                
+            #     ratio=torch.tensor([1])
+                
+            #     print("ratio is ",ratio)
+
+            # else:
+            #     ratio=(1-entropy_list[:,1:].mean()/self.entropy_rl)/(1-entropy_list[:,0].mean()/self.entropy_sft)
+                
+            #     accuracy_rewards[:,0]=ratio*accuracy_rewards[:,0]
+            
+            #     print("ratio is ",ratio)
+            
+            for experience, r_std in zip(experiences, accuracy_reward_std.flatten().chunk(len(experiences))):
+                experience.r_std = r_std
+                experience.info['r_std'] = r_std
+            for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
+                experience.r_mean = r_mean
+                experience.info['r_mean'] = r_mean
+            return experiences, rewards
+        elif args.advantage_estimator == "ttrl":
+            rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            # print('rewards',rewards)
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            
+            rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            
             # rewards = (rewards - rewards.mean(-1, keepdim=True))
             rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
             
@@ -878,8 +896,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 queries = self.tokenizer.batch_decode(sequences_list, skip_special_tokens=True)
 
             if self.custom_reward_func:
-                r= self.custom_reward_func.remote(queries, samples.prompts, samples.labels,responses_lengths=samples.response_length.cpu().tolist())
-                # r= self.custom_reward_func.remote(queries, samples.prompts, samples.labels)
+                r= self.custom_reward_func.remote(queries, samples.prompts, samples.labels, responses_lengths=samples.response_length.cpu().tolist())
                 r_refs.append(r)
             else:
                 for rm in self.remote_rm_url:
@@ -1048,7 +1065,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         # 对'r_overlong'做同样的处理
         if 'r_overlong' in locals() or 'r_overlong' in globals():  
             info["overlong_reward"] = r_overlong
-            
+
         if self.strategy.args.perf:
             self.perf_stats["actor_value_rm_time"] += actor_value_rm_time
             self.perf_stats["wait_time"] += wait_time
