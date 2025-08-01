@@ -61,23 +61,60 @@ class PolicyLoss(nn.Module):
     def __init__(self, clip_eps: float = 0.2) -> None:
         super().__init__()
         self.clip_eps = clip_eps
-
     def forward(
         self,
+        args,
         log_probs: torch.Tensor,
         old_log_probs: torch.Tensor,
         advantages: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
         all_tokens:  int = None,
+        r_mean: Optional[torch.Tensor] = None,
+        num_actions = None,
     ) -> torch.Tensor:
-        ratio = (log_probs - old_log_probs).exp()
-        # ratio = (log_probs - log_probs.detach()).exp()
-        print(ratio.mean())
-        surr1 = ratio * advantages
-        surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps+0.08) * advantages
-        loss = -torch.min(surr1, surr2)
-        loss = masked_mean(loss, action_mask, dim=-1, all_tokens=all_tokens).mean()
-		return loss
+        
+        if args.ofrl == "LUFFY":
+            # loss=(0.1 * log_probs * (1 - log_probs)*advantages) / ((log_probs + 0.1) ** 2 )
+            
+            prob = torch.exp(log_probs)
+            old_prob = torch.exp(old_log_probs)
+            
+            
+            if (old_prob==1).all():
+                # print("old_prob is 1, this may cause division by zero")
+                ratio=prob/(prob+0.1)
+                
+            else:
+                ratio=prob/old_prob
+            # print(old_prob[0][:10])
+            
+            loss=-ratio * advantages
+        else:
+            
+            if (old_log_probs==0).all():
+                
+                print(f"r_mean value: {r_mean}")
+                
+                ratio = (log_probs - old_log_probs).exp()
+                
+                # ratio = (log_probs - torch.log(torch.exp(log_probs) + (torch.exp(old_log_probs) - torch.exp(log_probs)) * r_mean[0])).exp()
+                print('old_log_probs is 1, this may cause division by zero  ',torch.mean(torch.log(torch.exp(log_probs) + (torch.exp(old_log_probs) - torch.exp(log_probs)) * r_mean[0])))
+                
+            else:
+                ratio = (log_probs - old_log_probs).exp()
+            # ratio = (log_probs - log_probs.detach()).exp()
+            print(ratio.mean())
+            
+            # surr1 = ratio * advantages
+            # surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps+0.08) * advantages
+            # loss = -torch.min(surr1, surr2)
+            
+            
+            loss=-ratio * advantages
+            
+        loss = masked_mean(loss, action_mask, all_tokens=all_tokens,dim=-1,num_actions=num_actions).mean()
+        # loss=loss.sum(axis=-1).mean()/3000
+        return loss
 
 
 class ValueLoss(nn.Module):

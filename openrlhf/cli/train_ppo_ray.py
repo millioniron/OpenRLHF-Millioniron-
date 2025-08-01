@@ -20,7 +20,6 @@ import os
 
 os.environ["WANDB__SERVICE_WAIT"] = "300"
 
-
 # NOTE: reward function for multiple reward models, replace this with your own function!
 def reward_fn(rewards: List[torch.Tensor]):
     return torch.stack(rewards).sum(dim=0)
@@ -334,9 +333,13 @@ if __name__ == "__main__":
     parser.add_argument("--save_value_network", action="store_true", default=False, help="Save critic model")
     parser.add_argument("--actor_learning_rate", type=float, default=1e-6)
     parser.add_argument("--critic_learning_rate", type=float, default=9e-6)
-    parser.add_argument("--lr_warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--lr_warmup_ratio", type=float, default=0.01)
     parser.add_argument("--kl_target", type=float, default=None)
     parser.add_argument("--init_kl_coef", type=float, default=0.01, help="KL penalty in PPO")
+    
+    parser.add_argument("--entropy_coef", type=float, default=0, help="entropy_coef for actor")
+    parser.add_argument("--mixpolicy", action="store_true", default=False, help="combine rl and sft")
+    
     parser.add_argument(
         "--kl_estimator",
         type=str,
@@ -354,9 +357,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--advantage_estimator",
         type=str,
-        choices=["gae", "reinforce", "rloo", "reinforce_baseline", "group_norm", 'dr_grpo'],
+        choices=["gae", "reinforce", "rloo", "reinforce_baseline", "group_norm",'dr_grpo','ttrl'],
         default="gae",
-        help="Choose advantage estimation method: gae, reinforce, rloo, reinforce_baseline, group_norm,dr_grpo",
+        help="Choose advantage estimation method: gae, reinforce, rloo, reinforce_baseline, group_norm,dr_grpo,ttrl",
+    )
+    
+    parser.add_argument(
+        "--ofrl",
+        type=str,
+        choices=["LUFFY", "Ours",'LUFFY-noshapeing'],
+        default="Ours",
+        help="Choose advantage estimation method: LUFFY, Ours, LUFFY-noshapeing",
     )
     parser.add_argument("--use_kl_loss", action="store_true", default=False, help="whether to use KL loss from GRPO")
 
@@ -434,7 +445,7 @@ if __name__ == "__main__":
         else:
             args.critic_pretrain = args.pretrain
 
-    if args.advantage_estimator in ["rloo", "reinforce_baseline", "group_norm"]:
+    if args.advantage_estimator in ["rloo", "reinforce_baseline", "group_norm",'ttrl']:
         assert args.n_samples_per_prompt > 1, f"{args.advantage_estimator} requires n_samples_per_prompt > 1"
 
     if args.remote_rm_url:

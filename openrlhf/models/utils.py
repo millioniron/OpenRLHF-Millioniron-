@@ -133,7 +133,15 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor, temperatur
     return log_probs_labels
 
 
-def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None, all_tokens: int=None) -> torch.Tensor:
+def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None , all_tokens: int=None ,num_actions=None ) -> torch.Tensor:
+    
+    
+    if num_actions :
+        split_tensors = torch.split(tensor, num_actions, dim=1)
+        loss = 0.0
+        for s, sub_tensor in zip(num_actions, split_tensors):
+            loss += sub_tensor.mean() * all_tokens / s  
+        return loss
     if all_tokens is None:
         if mask is None:
             return tensor.mean(axis=dim)
@@ -142,7 +150,7 @@ def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = N
         if mask is None:
             return tensor.sum(axis=dim)/all_tokens
         return (tensor * mask).sum(axis=dim) / all_tokens
-
+    
 
 
 def masked_normalize(tensor: torch.Tensor, mask: torch.Tensor, dim: int = 1, eps: float = 1e-8) -> torch.Tensor:

@@ -8,9 +8,8 @@ from numpy import mean
 import torch
 import torch.nn.functional as F
 
-
-from .experience_maker import Experience
 from torch.distributed import all_gather_object
+from .experience_maker import Experience
 
 
 @dataclass
@@ -30,6 +29,9 @@ class BufferItem:
     r_accuracy:(1)
     r_std:(1)
     r_mean:(1)
+    entropy_old: (1)
+    entropy_old_sft: (1)
+    entropy_old_rl: (1)
 
     "A" is the number of actions.
     """
@@ -46,12 +48,14 @@ class BufferItem:
     advantages: torch.Tensor
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
-    
+    entropy_old: Optional[torch.Tensor]
+    entropy_old_sft: Optional[torch.Tensor]
+    entropy_old_rl: Optional[torch.Tensor]
     info: Optional[dict]
 
 
 def split_experience_batch(experience: Experience) -> List[BufferItem]:
-    batch_size = len(experience.sequences)
+    batch_size = len(experience.sequences) 
     batch_kwargs = [{} for _ in range(batch_size)]
     keys = (
         "sequences",
@@ -66,6 +70,9 @@ def split_experience_batch(experience: Experience) -> List[BufferItem]:
         "r_accuracy",
         "r_std",
         "r_mean",
+        "entropy_old",
+        "entropy_old_sft",
+        "entropy_old_rl",
     )
     for key in keys:
         value = getattr(experience, key)
@@ -76,6 +83,8 @@ def split_experience_batch(experience: Experience) -> List[BufferItem]:
         vals = value
         if isinstance(vals, torch.Tensor):
             vals = torch.unbind(vals)
+        # print('key:',key)
+        # print('vals:',vals)
         assert batch_size == len(vals)
         for i, v in enumerate(vals):
             batch_kwargs[i][key] = v
@@ -121,6 +130,9 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
         "r_accuracy",
         "r_std",
         "r_mean",
+        "entropy_old",
+        "entropy_old_sft",
+        "entropy_old_rl",
     )
     for key in keys:
         vals = [getattr(item, key) for item in items]
@@ -139,7 +151,7 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
 
 def remove_padding_in_sequences(items):
     for item in items:
-        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask ,r_format,r_accuracy,r_std,r_mean= (
+        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask ,r_format,r_accuracy,r_std,r_mean,entropy_old,entropy_old_sft,entropy_old_rl= (
             item.sequences,
             item.action_log_probs,
             item.base_action_log_probs,
@@ -152,6 +164,9 @@ def remove_padding_in_sequences(items):
             item.r_accuracy,
             item.r_std,
             item.r_mean,
+            item.entropy_old,
+            item.entropy_old_sft,
+            item.entropy_old_rl,
         )
         right_pad = (1 - act_mask.long()).sum()
         right_pad = None if right_pad == 0 else -right_pad
@@ -171,6 +186,9 @@ def remove_padding_in_sequences(items):
             item.r_accuracy,
             item.r_std,
             item.r_mean,
+            item.entropy_old,
+            item.entropy_old_sft,
+            item.entropy_old_rl,
             
         ) = (
             seq[left_pad:right_pad],
@@ -185,6 +203,9 @@ def remove_padding_in_sequences(items):
             r_accuracy[:right_pad],
             r_std[:right_pad],
             r_mean[:right_pad],
+            entropy_old[:right_pad] ,
+            entropy_old_sft[:right_pad] ,
+            entropy_old_rl[:right_pad],
         )
     return items
 
@@ -209,6 +230,8 @@ class NaiveReplayBuffer(ABC):
         self.packing_samples = packing_samples
         self.target_device = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.items: List[BufferItem] = []
+        self.entropy_sft=None
+        self.entropy_rl=None
 
     @torch.no_grad()
     def append(self, experience: Experience) -> None:
@@ -250,9 +273,31 @@ class NaiveReplayBuffer(ABC):
     def __getitem__(self, idx: int) -> BufferItem:
         return self.items[idx]
     
+    # def filter(self,strategy) -> None:
+        
+    #     # filtered_count = sum(1 for item in self.items if item.r_std <= 0) 
+        
+    #     print("****************"*5)
+    #     print('items_count:',len(self.items))
+
+        
+    #     self.items = [item for item in self.items if item.r_std > 0]
+        
+    #     # self.items = [
+    #     #                 item for item in self.items 
+    #     #                 if (item.r_mean > 0.5 and item.r_accuracy == 0) or
+    #     #                 (item.r_mean == 0.5) or 
+    #     #                 (item.r_mean < 0.5 and item.r_accuracy == 1)
+    #     #             ]
+        
+    #     print("****************"*5)
+    #     print('items_count:',len(self.items))
+        
+    #     # return filtered_count
+        
     def filter(self,strategy) -> None:
 
-		# 收集所有GPU上的self.items
+            # 收集所有GPU上的self.items
         gathered_items = [[] for _ in range(strategy.world_size)]
         all_gather_object(gathered_items, self.items)
         
@@ -263,30 +308,177 @@ class NaiveReplayBuffer(ABC):
         
         self.items = aggregated_items
         
-        # print("****************"*5)
-        # print('items_count:',len(self.items))
+        print("****************"*5)
+        print('items_count:',len(self.items))
         
-        filtered_count = sum(1 for item in self.items if item.r_std <= 0)
+        filtered_std_count = sum(1 for item in self.items if item.r_std <= 0)
+        
+        filtered_0_count = sum(1 for item in self.items if item.r_mean == 0)
+        
+        filtered_low_count = sum(1 for item in self.items if item.r_mean == 1/strategy.args.n_samples_per_prompt)
+        
+        # self.items = [item for item in self.items if (item.r_std > 0) and (item.r_mean > 1/strategy.args.n_samples_per_prompt)]
         
         self.items = [item for item in self.items if item.r_std > 0]
+
         
 
-        # print("****************"*5)
-        # print('filtered_count:',filtered_count)
-        # print("****************"*5)
-        # print(strategy.world_size)
+        print("****************"*5)
+        print('filtered_std_count:',filtered_std_count)
+        
+        print("****************"*5)
+        print('filtered_0_count:',filtered_0_count)
+        
+        print("****************"*5)
+        print('filtered_low_count:',filtered_low_count)
         
         
         chunk_size = len(self.items) // strategy.world_size
-        
+        ###### 回来添加保证是8的就行
         self.items = self.items[strategy.get_rank() * chunk_size : (strategy.get_rank() + 1) * chunk_size]
-        # print("****************"*5)
-        # print('filtered_items_count:',len(self.items))
+        print("****************"*5)
+        print('filtered_items_count:',len(self.items))
+        
+        
         
     def collate_fn(self, batch) -> Experience:
         experience = make_experience_batch(batch, self.packing_samples)
         return experience
 
+    def sample_weights(self, k=0) -> List[float]:
+        """
+        Calculate and return sample weights based on the mean reward.
+
+        This method computes weights for each item in the buffer by comparing
+        the mean reward of all items (`r_mean`) with the reward of each individual
+        item. The weights are calculated using different methods based on the value of k.
+
+        Args:
+            k (int): Mode selector (0 or 1).
+
+        Returns:
+            List[float]: A list of weights for each item in the buffer.
+        """
+        p_l = [item.r_mean.item() for item in self.items]
+        p = torch.mean(torch.tensor(p_l)).item()
+
+        if k == 0:
+            weights = 1 - torch.abs(torch.tensor(p_l) - p)
+            # Ensure non-negative weights (handle cases where |difference| >1)
+            weights = torch.clamp(weights, min=0.0)
+            
+            
+            N = len(weights)  
+            
+            sum_weights = weights.sum()  
+
+            # 计算缩放因子
+            scale_factor = N / sum_weights  
+
+            # 缩放权重
+            weights = weights * scale_factor  
+            
+        elif k == 1:
+            # Protect against division by zero by clamping p between epsilon and 1-epsilon
+            epsilon = 1e-8
+            p = max(min(p, 1 - epsilon), epsilon)  # Ensure p ∈ (0, 1)
+
+            p_l_tensor = torch.tensor(p_l)
+
+            def piecewise_linear(p_l_tensor, p_val):
+                left_slope = 1.0 / p_val
+                right_slope = -1.0 / (1 - p_val)
+                condition = p_l_tensor <= p_val
+                left_val = left_slope * p_l_tensor
+                right_val = 1 + right_slope * (p_l_tensor - p_val)
+                return torch.where(condition, left_val, right_val)
+
+            weights = piecewise_linear(p_l_tensor, p)
+            # Ensure weights stay within [0, 1]
+            weights = torch.clamp(weights, min=0.0, max=1.0)
+        else:
+            raise ValueError("k must be 0 or 1")
+
+        return weights.tolist()
+
+    def difficulty_weighting(self,k=0) -> None:
+        sample_weights = self.sample_weights(k)
+        for i, item in enumerate(self):
+            item.advantages = getattr(item, "advantages") * sample_weights[i]
+            
+    def entropy_weighting(self,strategy) -> float:
+        # 收集所有GPU上的self.items
+        gathered_items = [[] for _ in range(strategy.world_size)]
+        all_gather_object(gathered_items, self.items)
+        
+        # 合并列表#####注意8的倍数
+        aggregated_items = []
+        for sublist in gathered_items:
+            aggregated_items.extend(sublist)
+            
+            
+        entropy_old_list= [item.entropy_old for item in aggregated_items]
+        
+        r_mean_list= [item.r_mean for item in aggregated_items]
+        
+        
+        entropy_sft_list = [entropy for i, entropy in enumerate(entropy_old_list) if i % 8 == 0]
+        entropy_rl_list = [entropy for i, entropy in enumerate(entropy_old_list) if i % 8 != 0]
+        
+        
+        
+        r_mean=sum(r_mean_list)/len(r_mean_list)
+        
+        entropy_sft=sum(entropy_sft_list)/len(entropy_sft_list)
+        
+        entropy_rl=sum(entropy_rl_list)/len(entropy_rl_list)
+        
+        
+        
+        print("entropy_old_sft is ",entropy_sft)
+        print("entropy_old_rl is ",entropy_rl)
+        
+        if self.entropy_sft==None and self.entropy_rl==None:
+            print("entropy is Done")
+            ratio=1
+        else:
+            print("self.entropy_sft is ",self.entropy_sft)
+            print("self.entropy_rl is ", self.entropy_rl)
+            ratio=(1-entropy_sft/self.entropy_sft)/(1-entropy_rl/self.entropy_rl)
+        self.entropy_sft=entropy_sft
+        self.entropy_rl=entropy_rl
+        
+        
+        ####version 1
+        
+        
+        
+        
+
+            
+        ########version 5
+        if ratio > 0:
+            ratio = min(max(ratio, 1), 7)
+        else:
+            ratio=-ratio
+            ratio = min(max(ratio, 1), 7)
+        
+            
+        
+        
+        
+        
+    
+        
+        print("ratio is ",ratio)
+        
+        for i, item in enumerate(self):
+            if i%strategy.args.n_samples_per_prompt ==0 :
+                item.advantages = getattr(item, "advantages") * ratio
+        
+        return ratio
+        
+    
     def normalize(self, attribute: str, strategy) -> None:
         assert attribute == "advantages"
         items = []

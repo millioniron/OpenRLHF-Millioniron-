@@ -12,10 +12,13 @@ from tqdm import tqdm
 
 from openrlhf.models import Actor, GPTLMLoss, PolicyLoss, ValueLoss
 from openrlhf.models.ring_attn_utils import pad_sequences, unpad_sequences
-from openrlhf.models.utils import compute_approx_kl, masked_mean
+from openrlhf.models.utils import compute_approx_kl, masked_mean, unpacking_samples
 from openrlhf.utils.distributed_sampler import DistributedSampler
 
 from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveExperienceMaker, NaiveReplayBuffer
+
+import random
+
 
 
 class PPOTrainer(ABC):
@@ -156,6 +159,8 @@ class PPOTrainer(ABC):
         self.replay_buffer = NaiveReplayBuffer(
             micro_train_batch_size, buffer_limit, buffer_cpu_offload, packing_samples
         )
+        self.entropy_sft=None 
+        self.entropy_rl=None
 
         # wandb/tensorboard setting
         self._wandb = None
@@ -173,6 +178,8 @@ class PPOTrainer(ABC):
                 name=strategy.args.wandb_run_name,
                 config=strategy.args.__dict__,
                 reinit=True,
+                settings=wandb.Settings(init_timeout=300),
+                mode='offline'
             )
 
             wandb.define_metric("train/global_step")
@@ -217,7 +224,6 @@ class PPOTrainer(ABC):
         steps = consumed_samples // args.rollout_batch_size + 1
         start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
         consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
-
         start_time=time.time()
         for episode in range(start_episode, args.num_episodes):
             if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
@@ -231,13 +237,11 @@ class PPOTrainer(ABC):
             )
 
             not_enough_attempts = 0
-            max_attempts = 3  # Maximum number of attempts to get enough samples
+            max_attempts = 6  # Maximum number of attempts to get enough samples
             
-            
-            
-            for rand_prompts, labels in self.prompts_dataloader:
+            for rand_prompts, labels, distills in self.prompts_dataloader:
                 for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(rand_prompts, labels, **self.generate_kwargs)
+                    self.experience_maker.make_experience_list(rand_prompts, labels, distills, **self.generate_kwargs)
                 ):
                     if i == 0:
                         output = self.tokenizer.batch_decode(
@@ -247,29 +251,42 @@ class PPOTrainer(ABC):
                     self.replay_buffer.append(experience)
                 if not_enough_attempts < max_attempts:
                     self.replay_buffer.filter(self.strategy)
-                if (len(self.replay_buffer) < args.rollout_batch_size*args.n_samples_per_prompt) and (not_enough_attempts < max_attempts):
+                if (len(self.replay_buffer) < args.rollout_batch_size*args.n_samples_per_prompt // self.strategy.world_size) and (not_enough_attempts < max_attempts):
                     self.strategy.print(f"Replay buffer is not enough, attempt {not_enough_attempts}/{max_attempts}")
                     not_enough_attempts += 1
                     continue
                 not_enough_attempts=0
-                self.replay_buffer.items = self.replay_buffer.items[:args.rollout_batch_size*args.n_samples_per_prompt]
-                
-                if self.args.advantage_estimator not in ["group_norm","dr_grpo"]:
+                # self.replay_buffer.items = self.replay_buffer.items[:args.rollout_batch_size*args.n_samples_per_prompt // self.strategy.world_size]
+                self.replay_buffer.items = random.sample(self.replay_buffer.items, args.rollout_batch_size*args.n_samples_per_prompt // self.strategy.world_size)
+                if self.args.advantage_estimator not in ["group_norm","dr_grpo",'ttrl']:
                     self.replay_buffer.normalize("advantages", self.strategy)
                 
-                if self.args.advantage_estimator not in ["dr_grpo"]:
+                if self.args.advantage_estimator not in ["dr_grpo",'ttrl']:
                     self.replay_buffer_all_tokens=self.replay_buffer.cal_all_tokens()
                     self.replay_buffer_all_tokens=self.strategy.all_reduce(self.replay_buffer_all_tokens,"sum")
-                    self.replay_buffer_all_tokens*=self.strategy.train_batch_size /self.strategy.accumulated_gradient / len(self.replay_buffer)
+                    self.replay_buffer_all_tokens * self.strategy.train_batch_size /self.strategy.accumulated_gradient / len(self.replay_buffer)
                 else:
-                    self.replay_buffer_all_tokens=self.args.generate_max_len*self.strategy.train_batch_size /self.strategy.accumulated_gradient
-		
+                    self.replay_buffer_all_tokens=3000
+                
+                #########
+                
+                
+                ratio = self.replay_buffer.entropy_weighting(self.strategy)
+                
+                
+                ########
+                # self.replay_buffer.difficulty_weighting()
+                
                 status = self.ppo_train(steps)
                 self.replay_buffer.clear()
 
                 if "kl" in status:
                     self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
                 status['time']=time.time()-start_time
+                status['ratio']=ratio
+                status['entropy_sft']=self.replay_buffer.entropy_sft
+                status['entropy_rl']=self.replay_buffer.entropy_rl
+                
                 pbar.set_postfix(status)
 
                 # logs/checkpoints
@@ -340,7 +357,7 @@ class PPOTrainer(ABC):
                     short_status["r_std"] = status["r_std"]
                 if "r_mean" in status:
                     short_status["r_mean"] = status["r_mean"]
-
+                    
                 if "critic_loss" in status:
                     short_status["cri"] = status["critic_loss"]
                     short_status["vals"] = status["values"]
@@ -382,6 +399,7 @@ class PPOTrainer(ABC):
             advantages = torch.cat(experience.advantages, dim=0).unsqueeze(0)
             num_actions = [v.numel() for v in experience.advantages]
             packed_seq_lens = [s.numel() for s in experience.sequences]
+            r_mean = experience.r_mean
             attention_mask = torch.cat(
                 [torch.full_like(s, i + 1) for i, s in enumerate(experience.sequences)], dim=0
             ).unsqueeze(0)
@@ -399,6 +417,7 @@ class PPOTrainer(ABC):
             num_actions = experience.action_mask.size(1)
             packed_seq_lens = None
             attention_mask = experience.attention_mask
+            r_mean = experience.r_mean
             if self.args.use_kl_loss and experience.base_action_log_probs is not None:
                 base_action_log_probs = experience.base_action_log_probs
 
@@ -424,17 +443,16 @@ class PPOTrainer(ABC):
                 action_log_probs=action_log_probs,
                 ring_attn_group=self.strategy.ring_attn_group,
             )
-
         # loss function
         actor_loss = self.actor_loss_fn(
+            self.args,
             action_log_probs,
             old_action_log_probs,
             advantages,
             action_mask=experience.action_mask,
-            all_tokens=self.replay_buffer_all_tokens
-        )
-        actor_kl_log = masked_mean(action_log_probs, mask=experience.action_mask, dim=-1).mean()
-        old_actor_kl_log = masked_mean(old_action_log_probs, mask=experience.action_mask, dim=-1).mean()
+            all_tokens=self.replay_buffer_all_tokens,
+            r_mean=r_mean,
+            num_actions=None,)
         
         with torch.no_grad():
             assert isinstance(experience.sequences, list), "Only support packed sequences"
@@ -469,6 +487,7 @@ class PPOTrainer(ABC):
             entropy = entropy_sum / total_tokens
         
         
+        
         if self.args.use_kl_loss:
             if self.initial_model is not None:
                 kl = compute_approx_kl(
@@ -479,9 +498,18 @@ class PPOTrainer(ABC):
                 )
             else:
                 kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
-                
-            kl_loss = masked_mean(kl, experience.action_mask, dim=-1, all_tokens=self.replay_buffer_all_tokens).mean()
-            experience.info["kl"] = kl_loss
+
+            if not self.args.packing_samples:
+                kl_mean = masked_mean(kl, experience.action_mask, dim=-1)
+            else:
+                # convert tensor into list of tensors so that it's easier to manipulate
+                # within dataset.
+
+                kl = unpacking_samples(kl, num_actions)
+                kl_mean = torch.tensor([each_kl.mean() for each_kl in kl], device=action_log_probs.device)
+
+            kl_loss = kl_mean.mean()
+            experience.info["kl"] = kl_loss.item()
         else:
             kl_loss = 0
 
@@ -490,6 +518,7 @@ class PPOTrainer(ABC):
             aux_loss = output.aux_loss
         else:
             aux_loss = 0
+        # loss = actor_loss + aux_loss * self.args.aux_loss_coef + kl_loss * self.kl_ctl.value+entropy * self.args.entropy_coef
         loss = actor_loss + aux_loss * self.args.aux_loss_coef + kl_loss * self.kl_ctl.value
         self.strategy.backward(loss, self.actor, self.actor_optim)
 
@@ -522,15 +551,23 @@ class PPOTrainer(ABC):
             self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
 
         # status
-        status = {"policy_loss": actor_loss.item(), "actor_kl_log":actor_kl_log.item(), "old_actor_kl_log":old_actor_kl_log.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0], "entropy": entropy}
+        # status = {"policy_loss": actor_loss.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0],"entropy": entropy.detach().item()}
+        
+        status = {"policy_loss": actor_loss.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0],"entropy": entropy}
+        
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
         for k, v in experience.info.items():
-            status[k] = v.mean().item()
+            if k == "kl":
+                status[k] = (
+                    (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
+                ).item()
+            else:
+                status[k] = v.mean().item()
             if k== "accuracy_reward":
                 corr_length=experience.info["response_length"][v==1]
                 incorr_length=experience.info["response_length"][v==0]
-        return status, corr_length, incorr_length
+        return status,corr_length,incorr_length
 
     def training_step_critic(self, experience: Experience) -> Dict[str, float]:
         self.critic.train()

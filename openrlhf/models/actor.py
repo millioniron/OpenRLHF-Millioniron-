@@ -7,7 +7,7 @@ from flash_attn.utils.distributed import all_gather
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
 from torch.nn import functional as F
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig,AutoConfig
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 
 from .ring_attn_utils import convert_ring_attn_params
@@ -74,6 +74,25 @@ class Actor(nn.Module):
             else:
                 nf4_config = None
 
+            
+            # custom_config = {
+            #     "max_position_embeddings": 16384,  # 扩展窗口大小
+            #     "rope_theta": 40000,               # 调整 RoPE theta
+            # }
+
+            # config = AutoConfig.from_pretrained(pretrain_or_model, **custom_config)
+            
+
+            # self.model = AutoModelForCausalLM.from_pretrained(
+            #     pretrain_or_model,
+            #     config=config,  # 使用自定义配置
+            #     trust_remote_code=True,
+            #     attn_implementation=attn_implementation,
+            #     quantization_config=nf4_config,
+            #     torch_dtype=torch.bfloat16 if bf16 else "auto",
+            #     device_map=device_map,
+            # )
+            
             self.model = AutoModelForCausalLM.from_pretrained(
                 pretrain_or_model,
                 trust_remote_code=True,

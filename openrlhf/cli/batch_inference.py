@@ -340,7 +340,12 @@ if __name__ == "__main__":
     parser.add_argument("--tp_size", type=int, default=torch.cuda.device_count())
     parser.add_argument("--max_num_seqs", type=int, default=256)
     parser.add_argument("--enable_prefix_caching", action="store_true", default=False)
-
+    parser.add_argument(
+        "--full_determinism",
+        action="store_true",
+        default=False,
+        help="Enable reproducible behavior during distributed training",
+    )
     # For Iterative generation and Rejection Sampling
     parser.add_argument(
         "--iter",

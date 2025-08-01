@@ -3,7 +3,7 @@ from abc import ABC
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
-
+import copy 
 import ray
 import torch
 import torch.distributed as dist
@@ -51,6 +51,10 @@ class Experience:
     r_accuracy: (B, A)
     r_std: (B, A)
     r_mean: (B,A)
+    num_actions: (B,A)
+    entropy_old: (B,1)
+    entropy_old_sft: (B,1)
+    entropy_old_rl: (B,1)
 
     "A" is the number of actions.
     """
@@ -65,9 +69,14 @@ class Experience:
     info: Optional[dict]
     r_format: Optional[torch.Tensor]
     r_accuracy: Optional[torch.Tensor]
-    r_mean: Optional[torch.Tensor]=None
     r_std: Optional[torch.Tensor]=None
+    r_mean: Optional[torch.Tensor]=None
     kl: Optional[torch.Tensor]=None
+    num_actions: Optional[torch.Tensor] = None
+    entropy_old: Optional[torch.Tensor] = None
+    entropy_old_sft: Optional[torch.Tensor] = None
+    entropy_old_rl: Optional[torch.Tensor] = None
+    
 
     @torch.no_grad()
     def to_device(self, device: torch.device):
@@ -85,6 +94,10 @@ class Experience:
         self.r_accuracy=to(self.r_accuracy, device)
         self.r_std=to(self.r_std, device)
         self.r_mean=to(self.r_mean, device)
+        self.num_actions = to(self.num_actions, device)
+        self.entropy_old = to(self.entropy_old, device) 
+        self.entropy_old_sft = to(self.entropy_old_sft, device)
+        self.entropy_old_rl = to(self.entropy_old_rl, device)
         return self
 
     def pin_memory(self):
@@ -100,8 +113,12 @@ class Experience:
         self.info = {key: pin_memory(value) for key, value in self.info.items()}
         self.r_format=pin_memory(self.r_format)
         self.r_accuracy=pin_memory(self.r_accuracy)
-        self.r_mean=pin_memory(self.r_mean)
         self.r_std=pin_memory(self.r_std)
+        self.r_mean=pin_memory(self.r_mean)
+        self.num_actions = pin_memory(self.num_actions)
+        self.entropy_old = pin_memory(self.entropy_old)
+        self.entropy_old_sft = pin_memory(self.entropy_old_sft)
+        self.entropy_old_rl = pin_memory(self.entropy_old_rl)
         return self
 
 
@@ -171,6 +188,8 @@ class NaiveExperienceMaker(ABC):
         self.reward_fn = reward_fn
         self.perf_stats = None
         self.advantage_estimator = strategy.args.advantage_estimator
+        self.entropy_sft=None 
+        self.entropy_rl=None
 
         # custom reward func for reinforced finetuning
         self.custom_reward_func = None
@@ -206,7 +225,7 @@ class NaiveExperienceMaker(ABC):
 
     @torch.no_grad()
     def make_experience_list(
-        self, all_prompts: Union[str, List[str]], all_labels, **generate_kwargs
+        self, all_prompts: Union[str, List[str]], all_labels,all_distills, **generate_kwargs
     ) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
@@ -232,7 +251,7 @@ class NaiveExperienceMaker(ABC):
         if self.strategy.ring_attn_group is not None:
             # Only rank 0 in the ring attention group executes the generation function, and then broadcasts it to all other ranks.
             if self.strategy.ring_attn_rank == 0:
-                samples_list = self.generate_samples(all_prompts, all_labels, **generate_kwargs)
+                samples_list = self.generate_samples(all_prompts, all_labels,all_distills, **generate_kwargs)
                 dist.broadcast_object_list(samples_list, src=dist.get_rank(), group=self.strategy.ring_attn_group)
             else:
                 world_size = torch.distributed.get_world_size() // args.ring_attn_size
@@ -243,7 +262,7 @@ class NaiveExperienceMaker(ABC):
                     samples_list, src=self.strategy.ring_attn_ranks[0], group=self.strategy.ring_attn_group
                 )
         else:
-            samples_list = self.generate_samples(all_prompts, all_labels, **generate_kwargs)
+            samples_list = self.generate_samples(all_prompts, all_labels, all_distills, **generate_kwargs)
 
         # vLLM offload when vllm_enable_sleep
         if self.strategy.args.vllm_enable_sleep:
@@ -259,7 +278,7 @@ class NaiveExperienceMaker(ABC):
             disable=not self.strategy.is_rank_0(),
         ):
             experiences.append(self.make_experience(samples).to_device("cpu"))
-
+        # print('len(experiences)',len(experiences))
         experiences, rewards = self.process_experiences(experiences)
 
         # calculate return and advantages
@@ -284,7 +303,7 @@ class NaiveExperienceMaker(ABC):
                     generate_kwargs["gamma"],
                     generate_kwargs["lambd"],
                 )
-            elif self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo"]:
+            elif self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm","dr_grpo",'ttrl']:
                 experience.returns = self.get_cumulative_returns(
                     reward,
                     experience.action_mask,
@@ -309,10 +328,14 @@ class NaiveExperienceMaker(ABC):
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], all_labels,all_distills, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
         """
+        '''
+        警告，必须使用vllm推理，如果你使用distill
+        '''
+        
         assert not getattr(self, "packing_samples", False)
         args = self.strategy.args
         self.actor.eval()
@@ -361,6 +384,7 @@ class NaiveExperienceMaker(ABC):
 
         # log probs
         action_log_probs = self.actor(sequences, num_actions, attention_mask)
+        # action_log_probs=None
 
         # init log probs
         if self.initial_model is not None:
@@ -408,7 +432,6 @@ class NaiveExperienceMaker(ABC):
         except IndexError:
             pass  # 如果索引不存在，什么都不做
 
-        r = r[0]
         info = {
             "kl": masked_mean(kl, action_mask, dim=-1),
             "reward": r,
@@ -463,74 +486,115 @@ class NaiveExperienceMaker(ABC):
         - rewards: List of rewards
         """
         args = self.strategy.args
+        
+        
+        
+        print('len(experiences)',len(experiences))
+        # if args.ofrl=='LUFFY':
+        for i in range(0,len(experiences)*args.micro_rollout_batch_size,args.n_samples_per_prompt):
+            group_index = i // args.micro_rollout_batch_size
+            item_index_in_group = i % args.micro_rollout_batch_size
+            experiences[group_index].action_log_probs[item_index_in_group].fill_(0)
+            # print(f".action_log_probs[{item_index_in_group}] set to 0")
+        
+        entropy_list = torch.cat([experience.info["entropy_list"] for experience in experiences])
+        entropy_list = entropy_list.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+        
+        # print('entropy_list :', entropy_list)
+        # entropy_olds=entropy_list.mean().mean().expand(entropy_list.shape[0], args.n_samples_per_prompt)
+        # entropy_old_sfts = entropy_list[:,0].mean().expand(entropy_list.shape[0], args.n_samples_per_prompt)
+        # entropy_old_rls = entropy_list[:,1:].mean().expand(entropy_list.shape[0], args.n_samples_per_prompt)
+        
+
+        # entropy_old_sft = entropy_list[:,0].mean().expand(1, len(experiences))
+        # entropy_old_rl = entropy_list[:,1:].mean().expand(1, len(experiences))
+        
+        # for experience, entropy_old_sft, entropy_old_rl in zip(experiences, entropy_old_sfts.flatten().chunk(len(experiences)),entropy_old_rls.flatten().chunk(len(experiences))):
+        for experience, entropy_old,  in zip(experiences, entropy_list.flatten().chunk(len(experiences))):
+            
+            # experience.entropy_old_sft = entropy_old_sft
+            # experience.entropy_old_rl = entropy_old_rl
+            experience.entropy_old = entropy_old
+            
+            
+            
+            
+            # experience.info['entropy_old_sft'] = entropy_old_sft
+            # experience.info['entropy_old_rl'] = entropy_old_rl
+            experience.info['entropy_old'] = entropy_old
+        
         # reward shaping for rloo and reinforce_baseline
         if args.advantage_estimator == "rloo":
             rewards = torch.cat([experience.info["reward"] for experience in experiences])
             rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-            baseline = (rewards.sum(-1, keepdim=True) - rewards) / (args.n_samples_per_prompt - 1)
+        
+            baseline = (rewards.sum(-1, keepdim=True) - rewards) / (args.n_samples_per_prompt - 1) 
             rewards = rewards - baseline
             rewards = rewards.flatten().to(device="cpu").chunk(len(experiences))
             
             
             accuracy_rewards = torch.cat([experience.info["accuracy_reward"] for experience in experiences])
             accuracy_rewards = accuracy_rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-            accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
+            accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             
             
-            for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
-                experience.r_mean = r_mean
-                experience.info['r_mean'] = r_mean
             for experience, r_std in zip(experiences, accuracy_reward_std.flatten().chunk(len(experiences))):
                 experience.r_std = r_std
                 experience.info['r_std'] = r_std
+            for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
+                experience.r_mean = r_mean
+                experience.info['r_mean'] = r_mean
             return experiences, rewards
         elif args.advantage_estimator == "reinforce_baseline":
             # REINFORCE++-baseline removed the / std and K3 kl loss in GRPO.
             # `/ std` is not needed in RL variance reduction theory, and `k3 KL` has a larger variance than `k1 KL` under a categorical distribution.
             rewards = torch.cat([experience.info["reward"] for experience in experiences])
             rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+
             rewards = rewards - rewards.mean(-1, keepdim=True)
             rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
             
             
             accuracy_rewards = torch.cat([experience.info["accuracy_reward"] for experience in experiences])
             accuracy_rewards = accuracy_rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-            accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
+            accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             
             
-            for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
-                experience.r_mean = r_mean
-                experience.info['r_mean'] = r_mean
             for experience, r_std in zip(experiences, accuracy_reward_std.flatten().chunk(len(experiences))):
                 experience.r_std = r_std
                 experience.info['r_std'] = r_std
+            for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
+                experience.r_mean = r_mean
+                experience.info['r_mean'] = r_mean
+                
             return experiences, rewards
         elif args.advantage_estimator == "group_norm":
             rewards = torch.cat([experience.info["reward"] for experience in experiences])
             rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+
             rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
-            # rewards = (rewards - rewards.mean(-1, keepdim=True))
             rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
             
             
             
             accuracy_rewards = torch.cat([experience.info["accuracy_reward"] for experience in experiences])
             accuracy_rewards = accuracy_rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-            accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
+            accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             
             
-            for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
-                experience.r_mean = r_mean
-                experience.info['r_mean'] = r_mean
             for experience, r_std in zip(experiences, accuracy_reward_std.flatten().chunk(len(experiences))):
                 experience.r_std = r_std
                 experience.info['r_std'] = r_std
+            for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
+                experience.r_mean = r_mean
+                experience.info['r_mean'] = r_mean
             return experiences, rewards
         elif args.advantage_estimator == "dr_grpo":
             rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            # print('rewards',rewards)
             rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
             rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
             # rewards = (rewards - rewards.mean(-1, keepdim=True))
@@ -538,6 +602,51 @@ class NaiveExperienceMaker(ABC):
             
             
             accuracy_rewards = torch.cat([experience.info["accuracy_reward"] for experience in experiences])
+            
+            
+            accuracy_rewards = accuracy_rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
+            accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
+            
+            # if self.entropy_sft==None and self.entropy_rl==None:
+                
+            #     self.entropy_sft=entropy_list[:,0].mean()
+                
+            #     self.entropy_rl=entropy_list[:,1:].mean()
+                
+            #     ratio=torch.tensor([1])
+                
+            #     print("ratio is ",ratio)
+
+            # else:
+            #     ratio=(1-entropy_list[:,1:].mean()/self.entropy_rl)/(1-entropy_list[:,0].mean()/self.entropy_sft)
+                
+            #     accuracy_rewards[:,0]=ratio*accuracy_rewards[:,0]
+            
+            #     print("ratio is ",ratio)
+            
+            for experience, r_std in zip(experiences, accuracy_reward_std.flatten().chunk(len(experiences))):
+                experience.r_std = r_std
+                experience.info['r_std'] = r_std
+                
+                # experience.ratio = ratio
+                # experience.info['ratio'] = ratio
+                
+            for experience, r_mean in zip(experiences, accuracy_reward_mean.flatten().chunk(len(experiences))):
+                experience.r_mean = r_mean
+                experience.info['r_mean'] = r_mean
+            return experiences, rewards
+        elif args.advantage_estimator == "ttrl":
+            rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            
+            rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            
+            # rewards = (rewards - rewards.mean(-1, keepdim=True))
+            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
+            
+            
+            accuracy_rewards = torch.cat([experience.info["accuracy_reward"] for experience in experiences])
             accuracy_rewards = accuracy_rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
             accuracy_reward_std = accuracy_rewards.std(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
             accuracy_reward_mean= accuracy_rewards.mean(-1, keepdim=True).expand(-1, args.n_samples_per_prompt)
@@ -550,6 +659,7 @@ class NaiveExperienceMaker(ABC):
                 experience.r_mean = r_mean
                 experience.info['r_mean'] = r_mean
             return experiences, rewards
+        
         # default rewards
         return experiences, [experience.info["reward"] for experience in experiences]
 
@@ -666,7 +776,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
     @torch.no_grad()
     def make_experience_list(
-        self, all_prompts: Union[str, List[str]], all_labels, **generate_kwargs
+        self, all_prompts: Union[str, List[str]], all_labels,all_distills, **generate_kwargs
     ) -> List[Experience]:
         if self.strategy.args.perf:
             self.perf_stats = {
@@ -674,7 +784,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 "actor_value_rm_time": 0,
                 "wait_time": 0,
             }
-        experiences = super().make_experience_list(all_prompts, all_labels, **generate_kwargs)
+        experiences = super().make_experience_list(all_prompts, all_labels,all_distills, **generate_kwargs)
         if self.critic is not None:
             for experience in experiences:
                 # send experience to critic
@@ -684,7 +794,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], all_labels,all_distills, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
 
@@ -692,10 +802,10 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         in which actor will be used to generate samples.
         """
         if self.vllm_engines is None:
-            return super().generate_samples(all_prompts, all_labels, **generate_kwargs)
+            return super().generate_samples(all_prompts, all_labels,all_distills, **generate_kwargs)
 
         # vLLM generation
-        samples = self._generate_vllm(all_prompts, all_labels, **generate_kwargs)
+        samples = self._generate_vllm(all_prompts, all_labels,all_distills, **generate_kwargs)
         return samples
 
     @torch.no_grad()
@@ -768,7 +878,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 queries = self.tokenizer.batch_decode(sequences_list, skip_special_tokens=True)
 
             if self.custom_reward_func:
-                r= self.custom_reward_func.remote(queries, samples.prompts, samples.labels, responses_lengths=samples.response_length.cpu().tolist())
+                r= self.custom_reward_func.remote(queries, samples.prompts, samples.labels,responses_lengths=samples.response_length.cpu().tolist())
+                # r= self.custom_reward_func.remote(queries, samples.prompts, samples.labels)
                 r_refs.append(r)
             else:
                 for rm in self.remote_rm_url:
@@ -780,14 +891,63 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             ray.get([self.reward_model[0].empty_cache.remote()])
 
         # log probs
-        action_log_probs = self.actor(
+        action_log_probs,output = self.actor(
             sequences,
             num_actions,
             attention_mask,
+            return_output=True,
             ring_attn_group=self.strategy.ring_attn_group,
             logps_allgather=True,
             packed_seq_lens=packed_seq_lens,
         )
+        
+
+        # if self.packing_samples and self.strategy.args.mixpolicy:
+        if self.packing_samples :
+            with torch.no_grad():
+                action_logits = output["logits"][:, :-1, :]
+                action_log_probs_all = torch.nn.functional.log_softmax(action_logits, dim=-1)
+
+                action_log_probs_all_list = []
+                offset = 0
+                for num_action, seq_len in zip(num_actions, packed_seq_lens):
+                    start, end = max(0, offset + seq_len - num_action - 1), offset + seq_len - 1
+                    action_log_probs_all_list.append(action_log_probs_all[:, start:end])
+                    offset += seq_len
+                action_log_probs_all = torch.cat(action_log_probs_all_list, dim=1)
+                
+                offset=0
+                action_entropy = []
+                for num_action in num_actions:
+                    start = offset
+                    end = offset + num_action
+                    temp_action_log_probs_all=action_log_probs_all[:,start:end]
+                    
+                    
+                    # Calculate entropy in chunks to avoid OOM
+                    chunk_size = 512  # Adjust this value based on your GPU memory
+                    num_chunks = (temp_action_log_probs_all.size(1) + chunk_size - 1) // chunk_size
+                    entropy_sum = 0
+                    total_tokens = 0
+
+                    for i in range(num_chunks):
+                        start_idx = i * chunk_size
+                        end_idx = min((i + 1) * chunk_size, temp_action_log_probs_all.size(1))
+                        chunk = temp_action_log_probs_all[:, start_idx:end_idx]
+
+                        # Calculate entropy for this chunk
+                        chunk_probs = chunk.exp()
+                        chunk_entropy = -(chunk_probs * chunk).sum(-1)
+                        entropy_sum += chunk_entropy.sum().item()
+                        total_tokens += chunk_entropy.numel()
+
+                    entropy = entropy_sum / total_tokens
+                    action_entropy.append(entropy)
+                    offset+=num_action
+                entropy_list = torch.tensor(action_entropy)
+                # print("entropy list:", entropy_list)
+        
+        
         actor_value_rm_time = time.time() - start
 
         # wait initial/critic/reward model done
@@ -861,13 +1021,14 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             pass  # 如果索引不存在，什么都不做
 
         r = r[0]
-        
+        # print("reward:**********", r)
         info = {
             "kl": kl_mean,
             "reward": r,
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
+            'entropy_list': entropy_list,
         }
         
         # 检查并添加'r_format'，如果它存在的话
@@ -887,10 +1048,11 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         # 对'r_overlong'做同样的处理
         if 'r_overlong' in locals() or 'r_overlong' in globals():  
             info["overlong_reward"] = r_overlong
-
+            
         if self.strategy.args.perf:
             self.perf_stats["actor_value_rm_time"] += actor_value_rm_time
             self.perf_stats["wait_time"] += wait_time
+
 
         experience = Experience(
             sequences,
@@ -905,12 +1067,16 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             r_format,
             r_accuracy,
             kl=kl,
-        )
+            num_actions=num_actions,
+            entropy_old=None,
+            entropy_old_sft=None,
+            entropy_old_rl=None,
+            )
 
         self.actor.train()  # reset model state
         return experience
 
-    def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> List[Samples]:
+    def _generate_vllm(self, all_prompts: List[str], all_labels,all_distills, **kwargs) -> List[Samples]:
         from vllm import SamplingParams
 
         # round-robin load balance
@@ -934,11 +1100,16 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             skip_special_tokens=kwargs.get("skip_special_tokens", True),
             include_stop_str_in_output=True,
         )
-
-        # Expand prompt list based on the number of samples per prompt
-        all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
-        all_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], [])
-        all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
+        if self.strategy.args.mixpolicy:
+            all_prompts = sum([[prompt] * (args.n_samples_per_prompt-1) for prompt in all_prompts], [])
+            all_labels = sum([[label] * (args.n_samples_per_prompt) for label in all_labels], [])
+            all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
+        else:
+            all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
+            all_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], [])
+            all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
+        
+        
 
         # Distribute requests to engines and collect responses to outputs
         refs = []
@@ -960,8 +1131,44 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         all_output_refs = []
         for i, llm in enumerate(llms):
             all_output_refs.append(llm.get_responses.remote(rank))
-        all_outputs = sum(ray.get(all_output_refs), [])
+            
+        
+        if self.strategy.args.mixpolicy:
+            # temp_all_outputs = sum(ray.get(all_output_refs), [])
+        
+            # all_outputs=[]
+            
+            # all_distills_token_ids=self.tokenize_fn(all_distills, self.strategy.args.generate_max_len, padding=False)["input_ids"]
 
+            # for i in range(0,len(temp_all_outputs),self.strategy.args.n_samples_per_prompt):
+                
+            #     chunk= temp_all_outputs[i:i+self.strategy.args.n_samples_per_prompt]
+                
+            #     chunk[0].outputs[0].token_ids=all_distills_token_ids[i // self.strategy.args.n_samples_per_prompt]
+                
+            #     all_outputs.extend(chunk)
+            temp_all_outputs = sum(ray.get(all_output_refs), [])
+            # print("temp_all_outputs length:", len(temp_all_outputs))
+        
+            all_outputs=[]
+            
+            all_distills_token_ids=self.tokenize_fn(all_distills, self.strategy.args.generate_max_len, padding=False)["input_ids"]
+
+            for i in range(0,len(temp_all_outputs),self.strategy.args.n_samples_per_prompt-1):
+                
+                chunk= temp_all_outputs[i:i+self.strategy.args.n_samples_per_prompt-1]
+                
+                modified_first = copy.deepcopy(chunk[0])
+                
+                modified_first.outputs[0].token_ids=all_distills_token_ids[i // (self.strategy.args.n_samples_per_prompt-1)]
+                
+                new_chunk = [modified_first] + chunk
+                
+                all_outputs.extend(new_chunk)
+                
+        else:
+            all_outputs = sum(ray.get(all_output_refs), [])
+        
         samples_list = []
         for i in range(0, len(all_outputs), args.micro_rollout_batch_size):
             outputs = all_outputs[i : i + self.strategy.args.micro_rollout_batch_size]

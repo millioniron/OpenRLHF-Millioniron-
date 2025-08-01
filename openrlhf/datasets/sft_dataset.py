@@ -145,7 +145,6 @@ class SFTDataset(Dataset):
             apply_chat_template=None if self.pretrain_mode else self.apply_chat_template,
             multiturn=self.multiturn,
         )
-
         if not self.pretrain_mode:
             prompt_token = self.tokenizer(
                 prompt,

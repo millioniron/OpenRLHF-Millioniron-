@@ -4,6 +4,7 @@ import os
 import torch
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
+from collections import Counter
 
 def reward_func(queries, prompts, labels,responses_lengths,**kwargs):
     
@@ -31,7 +32,7 @@ def reward_func(queries, prompts, labels,responses_lengths,**kwargs):
     
     ##add overlong filtering
     
-    overlong_rewards=[(5096 - 1000- response_length) / 1000 if response_length > 5096 - 1000 else 0 for response_length in responses_lengths]
+    overlong_rewards=[(8192 - 2000- response_length) / 2000 if response_length > 8192 - 2000 else 0 for response_length in responses_lengths]
     # overlong_rewards=[(4096 - 1000- len(response)) / 1000  if len(response) > 4096 - 1000 else 0 for response in responses]
 
     

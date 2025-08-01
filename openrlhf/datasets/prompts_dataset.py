@@ -26,7 +26,7 @@ def preprocess_data(data, input_template=None, input_key="input", label_key=None
             #     {"role": "user", "content": chat+"Please put your final answer within \\boxed{}."}]                
             #     # {"role": "user", "content": chat}]
             chat = [
-                {"role": "user", "content": chat+"Please reason step by step, and put your final answer within \\boxed{}."}]                
+                {"role": "user", "content": chat}]                
                 # {"role": "user", "content": chat}]
         prompt = apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
     else:
@@ -36,7 +36,11 @@ def preprocess_data(data, input_template=None, input_key="input", label_key=None
     # print(prompt[0])
     # for Reinforced Fine-tuning
     label = "" if label_key is None else data[label_key]
-    return prompt, label
+
+    distill = data.get("distill", None)
+    
+    return prompt, label, distill
+    
 
 
 class PromptDataset(Dataset):
@@ -71,14 +75,16 @@ class PromptDataset(Dataset):
 
         self.prompts = []
         self.labels = []
+        self.disitlls = []
         for data in tqdm(dataset, desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
-            prompt, label = preprocess_data(data, input_template, input_key, label_key, apply_chat_template)
+            prompt, label, disitll = preprocess_data(data, input_template, input_key, label_key, apply_chat_template)
             self.prompts.append(prompt)
             self.labels.append(label)
+            self.disitlls.append(disitll)
 
     def __len__(self):
         length = len(self.prompts)
         return length
 
     def __getitem__(self, idx):
-        return self.prompts[idx], self.labels[idx]
+        return self.prompts[idx], self.labels[idx], self.disitlls[idx]
